@@ -397,6 +397,91 @@ EOF
 	[[ "$output" != *"/2.1.102"* ]]
 }
 
+@test "clean_dev_ai_agents cleans OpenCode disposable logs and runtime artifacts by age" {
+    local log_root="$HOME/.local/share/opencode/log"
+    local output_root="$HOME/.local/share/opencode/tool-output"
+    local snapshot_root="$HOME/.local/share/opencode/snapshot"
+    mkdir -p "$log_root" "$output_root" "$snapshot_root"
+    touch -t 202001010000 "$log_root/old.log"
+    touch "$log_root/current.log"
+    mkdir -p "$output_root/old" "$output_root/current" "$snapshot_root/old" "$snapshot_root/current"
+    touch -t 202001010000 "$output_root/old" "$snapshot_root/old"
+    touch "$output_root/current" "$snapshot_root/current"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+safe_clean() { echo "$1|$2"; }
+MOLE_AI_AGENT_RETENTION_DAYS=14 clean_dev_ai_agents
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"$log_root/old.log|OpenCode old logs"* ]]
+    [[ "$output" != *"$log_root/current.log"* ]]
+    [[ "$output" == *"$output_root/old|OpenCode old tool output"* ]]
+    [[ "$output" != *"$output_root/current"* ]]
+    [[ "$output" == *"$snapshot_root/old|OpenCode old snapshots"* ]]
+    [[ "$output" != *"$snapshot_root/current"* ]]
+}
+
+@test "clean_dev_ai_agents cleans Codex disposable caches but preserves history and databases" {
+    mkdir -p "$HOME/.codex/.tmp" "$HOME/.codex/cache" "$HOME/.codex/log" "$HOME/.codex/sessions"
+    touch "$HOME/.codex/.tmp/plugin-build"
+    touch "$HOME/.codex/cache/tool-cache"
+    touch -t 202001010000 "$HOME/.codex/log/session-20200101T000000Z.jsonl"
+    touch "$HOME/.codex/log/session-current.jsonl"
+    touch "$HOME/.codex/history.jsonl"
+    touch "$HOME/.codex/logs_2.sqlite"
+    touch "$HOME/.codex/sessions/current.jsonl"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+safe_clean() { echo "$1|$2"; }
+MOLE_AI_AGENT_RETENTION_DAYS=14 clean_dev_ai_agents
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"$HOME/.codex/.tmp/plugin-build|Codex temporary files"* ]]
+    [[ "$output" == *"$HOME/.codex/cache/tool-cache|Codex cache"* ]]
+    [[ "$output" == *"$HOME/.codex/log/session-20200101T000000Z.jsonl|Codex old session logs"* ]]
+    [[ "$output" != *"$HOME/.codex/log/session-current.jsonl"* ]]
+    [[ "$output" != *"history.jsonl"* ]]
+    [[ "$output" != *"logs_2.sqlite"* ]]
+    [[ "$output" != *"$HOME/.codex/sessions/current.jsonl"* ]]
+}
+
+@test "clean_dev_ai_agents cleans Claude disposable cache and snapshots without project history" {
+    mkdir -p "$HOME/.claude/cache" "$HOME/.claude/debug" "$HOME/.claude/shell-snapshots" "$HOME/.claude/projects"
+    touch "$HOME/.claude/cache/changelog.md"
+    touch "$HOME/.claude/debug/latest"
+    touch -t 202001010000 "$HOME/.claude/shell-snapshots/snapshot-zsh-old.sh"
+    touch "$HOME/.claude/shell-snapshots/snapshot-zsh-current.sh"
+    touch "$HOME/.claude/projects/session.jsonl"
+    touch "$HOME/.claude/history.jsonl"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+safe_clean() { echo "$1|$2"; }
+MOLE_AI_AGENT_RETENTION_DAYS=14 clean_dev_ai_agents
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"$HOME/.claude/cache/changelog.md|Claude Code cache"* ]]
+    [[ "$output" == *"$HOME/.claude/debug/latest|Claude Code debug logs"* ]]
+    [[ "$output" == *"$HOME/.claude/shell-snapshots/snapshot-zsh-old.sh|Claude Code old shell snapshots"* ]]
+    [[ "$output" != *"snapshot-zsh-current.sh"* ]]
+    [[ "$output" != *"$HOME/.claude/projects/session.jsonl"* ]]
+    [[ "$output" != *"$HOME/.claude/history.jsonl"* ]]
+}
+
 @test "clean_dev_jetbrains_logs only targets JetBrains logs" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
 set -euo pipefail

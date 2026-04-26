@@ -1160,6 +1160,34 @@ clean_dev_jetbrains_logs() {
     safe_clean ~/Library/Logs/JetBrains/* "JetBrains IDE logs"
 }
 
+ai_agent_retention_days() {
+    local retention_days="${MOLE_AI_AGENT_RETENTION_DAYS:-14}"
+    [[ "$retention_days" =~ ^[0-9]+$ ]] || retention_days=14
+    echo "$retention_days"
+}
+
+clean_ai_agent_old_entries() {
+    local root="$1"
+    local label="$2"
+    local retention_days="$3"
+    local name_pattern="${4:-}"
+
+    [[ -d "$root" ]] || return 0
+    [[ "$retention_days" =~ ^[0-9]+$ ]] || retention_days=14
+
+    local -a find_args=("$root" -mindepth 1 -maxdepth 1)
+    if [[ -n "$name_pattern" ]]; then
+        find_args+=("-name" "$name_pattern")
+    fi
+    find_args+=("-mtime" "+$retention_days" "-print0")
+
+    local entry
+    while IFS= read -r -d '' entry; do
+        safe_clean "$entry" "$label"
+        note_activity
+    done < <(command find "${find_args[@]}" 2> /dev/null)
+}
+
 # AI coding agents (Claude Code, Cursor Agent, etc.) auto-update but never
 # remove previous versions, so ~/.local/share/<agent>/versions accumulates
 # hundreds of MB per release. Keep the most recently modified N entries
@@ -1169,6 +1197,8 @@ clean_dev_jetbrains_logs() {
 clean_dev_ai_agents() {
     local keep_previous="${MOLE_AI_AGENTS_KEEP:-1}"
     [[ "$keep_previous" =~ ^[0-9]+$ ]] || keep_previous=1
+    local retention_days
+    retention_days=$(ai_agent_retention_days)
 
     local -a agent_specs=(
         "$HOME/.local/share/claude/versions|Claude Code old version|$HOME/.local/bin/claude"
@@ -1249,6 +1279,30 @@ clean_dev_ai_agents() {
             idx=$((idx + 1))
         done
     done
+
+    # Codex: keep auth, config, history, SQLite state, and active sessions.
+    safe_clean "$HOME/.codex/.tmp"/* "Codex temporary files"
+    safe_clean "$HOME/.codex/cache"/* "Codex cache"
+    clean_ai_agent_old_entries "$HOME/.codex/log" "Codex old session logs" "$retention_days" "session-*.jsonl"
+    clean_ai_agent_old_entries "$HOME/.codex/archived_sessions" "Codex archived sessions" "$((retention_days * 2))" "*.jsonl"
+
+    # OpenCode: keep config, auth, database, storage, and installed runtime files.
+    clean_ai_agent_old_entries "$HOME/.local/share/opencode/log" "OpenCode old logs" "$retention_days" "*.log"
+    clean_ai_agent_old_entries "$HOME/.local/share/opencode/tool-output" "OpenCode old tool output" "$retention_days"
+    clean_ai_agent_old_entries "$HOME/.local/share/opencode/snapshot" "OpenCode old snapshots" "$retention_days"
+
+    # Claude Code: keep project transcripts, history, settings, plugins, and todos.
+    safe_clean "$HOME/.claude/cache"/* "Claude Code cache"
+    safe_clean "$HOME/.claude/debug"/* "Claude Code debug logs"
+    safe_clean "$HOME/.claude/downloads"/* "Claude Code downloads"
+    safe_clean "$HOME/.claude/statsig"/statsig.failed_logs.* "Claude Code failed telemetry logs"
+    clean_ai_agent_old_entries "$HOME/.claude/shell-snapshots" "Claude Code old shell snapshots" "$retention_days" "snapshot-*"
+
+    # Other coding-agent caches with clearly disposable cache/temp boundaries.
+    safe_clean "$HOME/.cache/aider"/* "Aider cache"
+    safe_clean "$HOME/.cache/gemini-cli"/* "Gemini CLI cache"
+    safe_clean "$HOME/.gemini/tmp"/* "Gemini CLI temporary files"
+    safe_clean "$HOME/.continue/cache"/* "Continue cache"
 }
 
 # Other language tool caches.
