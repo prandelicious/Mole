@@ -34,7 +34,6 @@ optimize_sudo_available() {
     fi
     [[ "${MOLE_OPTIMIZE_SUDO_AVAILABLE:-true}" == "true" ]]
 }
-
 opt_existing_path_size_kb() {
     local path="$1"
     [[ -e "$path" ]] || {
