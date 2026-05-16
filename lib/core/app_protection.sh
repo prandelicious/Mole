@@ -1314,7 +1314,8 @@ find_app_files() {
         while IFS= read -r vendor_nested_path; do
             [[ -n "$vendor_nested_path" && -e "$vendor_nested_path" ]] && files_to_clean+=("$vendor_nested_path")
         done < <(
-            find_vendor_nested_app_paths "$bundle_id" "$app_name" \                "$HOME/Library/Application Support" \
+            find_vendor_nested_app_paths "$bundle_id" "$app_name" \
+                "$HOME/Library/Application Support" \
                 "$HOME/Library/Caches" \
                 "$HOME/Library/Logs"
         )
@@ -1325,7 +1326,6 @@ find_app_files() {
     # find -name pattern. Without this, a bundle id containing glob metachars
     # (* ? [) or path separators could over-match unrelated user containers.
     if [[ "$bundle_id_valid" == "true" ]]; then
-
         [[ -f ~/Library/Preferences/"$bundle_id".plist ]] && files_to_clean+=("$HOME/Library/Preferences/$bundle_id.plist")
         [[ -d ~/Library/Preferences/"$bundle_id" ]] && files_to_clean+=("$HOME/Library/Preferences/$bundle_id")
         [[ -d ~/Library/Preferences/ByHost ]] && while IFS= read -r -d '' pref; do

@@ -160,6 +160,7 @@ func TestCollectNetworkUsesPrimedCountersForInitialRates(t *testing.T) {
 		t.Fatalf("expected 0.5 MB/s up, got %v", got[0].TxRateMBs)
 	}
 }
+
 func TestCollectNetworkClampsCounterReset(t *testing.T) {
 	original := ioCountersFunc
 	ioCountersFunc = func(bool) ([]gopsutilnet.IOCountersStat, error) {
@@ -178,6 +179,7 @@ func TestCollectNetworkClampsCounterReset(t *testing.T) {
 		rxHistoryBuf: NewRingBuffer(NetworkHistorySize),
 		txHistoryBuf: NewRingBuffer(NetworkHistorySize),
 	}
+
 	got, err := c.collectNetwork(base.Add(time.Second))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -189,4 +191,3 @@ func TestCollectNetworkClampsCounterReset(t *testing.T) {
 		t.Fatalf("expected reset counters to clamp to zero, got %+v", got[0])
 	}
 }
-

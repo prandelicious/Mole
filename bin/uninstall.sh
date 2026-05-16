@@ -515,13 +515,13 @@ uninstall_print_app_paths_with_mtime() {
     local app_path app_mtime
 
     [[ -d "$app_dir" ]] || return 0
+
     while IFS= read -r -d '' app_path; do
         [[ -n "$app_path" ]] || continue
         app_mtime=$(get_file_mtime "$app_path")
         printf '%s\t%s\n' "${app_mtime:-0}" "$app_path"
     done < <(command find "$app_dir" -maxdepth 3 -name "*.app" -print0 2> /dev/null)
 }
-
 
 uninstall_app_inventory_fingerprint() {
     local app_dir app_path app_mtime pkg_app_path
