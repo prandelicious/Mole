@@ -188,17 +188,17 @@ refresh_launch_services_after_uninstall() {
     set +e
     # Add 10s timeout to prevent hanging (gc is usually fast)
     # run_with_timeout falls back to shell implementation if timeout command unavailable
-    run_with_timeout 10 "$lsregister" -gc > /dev/null 2>&1 || true
-    # Add 15s timeout for rebuild (can be slow on some systems)
+    run_with_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" "$lsregister" -gc > /dev/null 2>&1 || true
+    # 15s: lsregister rebuild can be slow on some systems, see lib/core/timeouts.sh
     run_with_timeout 15 "$lsregister" -r -f -domain local -domain user -domain system > /dev/null 2>&1
     success=$?
     # 124 = timeout exit code (from run_with_timeout or timeout command)
     if [[ $success -eq 124 ]]; then
         debug_log "LaunchServices rebuild timed out, trying lighter version"
-        run_with_timeout 10 "$lsregister" -r -f -domain local -domain user > /dev/null 2>&1
+        run_with_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" "$lsregister" -r -f -domain local -domain user > /dev/null 2>&1
         success=$?
     elif [[ $success -ne 0 ]]; then
-        run_with_timeout 10 "$lsregister" -r -f -domain local -domain user > /dev/null 2>&1
+        run_with_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" "$lsregister" -r -f -domain local -domain user > /dev/null 2>&1
         success=$?
     fi
     set -e
@@ -301,8 +301,8 @@ remove_file_list() {
             count=$((count + ${#trash_batch[@]}))
         else
             # Batch failed wholesale: route each path through mole_delete so
-            # the per-file fallback (Trash retry, then permanent rm) runs and
-            # forensic logging stays intact.
+            # per-file Trash handling fails closed and forensic logging stays
+            # intact.
             fallback_paths+=("${trash_batch[@]}")
         fi
     fi
@@ -311,8 +311,8 @@ remove_file_list() {
         local fb
         for fb in "${fallback_paths[@]}"; do
             # mole_delete routes through Trash when MOLE_DELETE_MODE=trash
-            # (uninstall default), falls back to the underlying safe_* helpers
-            # in permanent mode or when Trash is unavailable. See #723.
+            # (uninstall default) and only uses safe_* permanent removal when
+            # the caller explicitly selected permanent mode. See #723.
             mole_delete "$fb" "$use_sudo" && ((++count)) || true
         done
     fi
@@ -343,11 +343,13 @@ batch_uninstall_applications() {
     _restore_uninstall_traps() {
         _cleanup_sudo_keepalive
         if [[ -n "$old_trap_int" ]]; then
+            # eval: restore previous trap captured by $(trap -p INT)
             eval "$old_trap_int"
         else
             trap - INT
         fi
         if [[ -n "$old_trap_term" ]]; then
+            # eval: restore previous trap captured by $(trap -p TERM)
             eval "$old_trap_term"
         else
             trap - TERM
@@ -737,22 +739,24 @@ batch_uninstall_applications() {
             # and would just produce stderr noise we discard.
             local leftover_kb=0
             local -a leftover_paths=()
-            while IFS= read -r _lf; do
-                [[ -n "$_lf" && -e "$_lf" ]] || continue
-                # Skip macOS-managed container stubs: containermanagerd protects
-                # these directories via com.apple.provenance xattr; rm -rf always
-                # fails on them by design. User data is already gone at this point.
-                if [[ "$_lf" == */Library/Containers/* && -f "$_lf/.com.apple.containermanagerd.metadata.plist" ]]; then
-                    continue
-                fi
-                leftover_paths+=("$_lf")
-            done <<< "$related_files"
+            if ! is_uninstall_dry_run; then
+                while IFS= read -r _lf; do
+                    [[ -n "$_lf" && -e "$_lf" ]] || continue
+                    # Skip macOS-managed container stubs: containermanagerd protects
+                    # these directories via com.apple.provenance xattr; rm -rf always
+                    # fails on them by design. User data is already gone at this point.
+                    if [[ "$_lf" == */Library/Containers/* && -f "$_lf/.com.apple.containermanagerd.metadata.plist" ]]; then
+                        continue
+                    fi
+                    leftover_paths+=("$_lf")
+                done <<< "$related_files"
 
-            if [[ ${#leftover_paths[@]} -gt 0 ]]; then
-                local _du_total
-                _du_total=$(command du -skcP "${leftover_paths[@]}" 2> /dev/null | awk 'END {print $1}')
-                if [[ "$_du_total" =~ ^[0-9]+$ ]]; then
-                    leftover_kb=$_du_total
+                if [[ ${#leftover_paths[@]} -gt 0 ]]; then
+                    local _du_total
+                    _du_total=$(command du -skcP "${leftover_paths[@]}" 2> /dev/null | awk 'END {print $1}')
+                    if [[ "$_du_total" =~ ^[0-9]+$ ]]; then
+                        leftover_kb=$_du_total
+                    fi
                 fi
             fi
 
@@ -1011,7 +1015,7 @@ batch_uninstall_applications() {
     if [[ $brew_apps_removed -gt 0 && "${MOLE_DRY_RUN:-0}" != "1" ]]; then
         (
             HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_AUTO_UPDATE=1 NONINTERACTIVE=1 \
-                run_with_timeout 30 brew autoremove > /dev/null 2>&1 || true
+                run_with_timeout "$MOLE_TIMEOUT_DISK_VERIFY_SEC" brew autoremove > /dev/null 2>&1 || true
         ) &
         disown $! 2> /dev/null || true
     fi

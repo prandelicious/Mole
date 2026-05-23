@@ -195,7 +195,7 @@ hint_collect_installed_gui_app_match_texts() {
                 "$(plutil -extract CFBundleDisplayName raw "$info" 2> /dev/null || echo "")"; do
                 [[ -n "$value" && "$value" != "(null)" ]] && printf '%s\n' "$value"
             done
-        done < <(run_with_timeout 2 find "$app_root" -maxdepth 2 -name "*.app" -print0 2> /dev/null || true)
+        done < <(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" find "$app_root" -maxdepth 2 -name "*.app" -print0 2> /dev/null || true)
     done
 
     local -a cask_roots=(
@@ -210,7 +210,7 @@ hint_collect_installed_gui_app_match_texts() {
             [[ -n "$cask_dir" ]] || continue
             cask_name="${cask_dir##*/}"
             printf '%s\n' "$cask_name"
-        done < <(run_with_timeout 1 find "$cask_root" -mindepth 1 -maxdepth 1 -type d -print0 2> /dev/null || true)
+        done < <(run_with_timeout 1 find "$cask_root" -mindepth 1 -maxdepth 1 -type d -print0 2> /dev/null || true) # 1s: shallow brew cask dir list, see lib/core/timeouts.sh
     done
 }
 
@@ -665,7 +665,7 @@ _dotdir_owner_collect_tokens() {
 
     if command -v brew > /dev/null 2>&1; then
         local cask_list=""
-        cask_list=$(HOMEBREW_NO_ENV_HINTS=1 run_with_timeout 5 brew list --cask 2> /dev/null) || true
+        cask_list=$(HOMEBREW_NO_ENV_HINTS=1 run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" brew list --cask 2> /dev/null) || true
         if [[ -n "$cask_list" ]]; then
             printf '%s\n' "$cask_list" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs 'a-z0-9' '\n'
         fi
@@ -718,6 +718,42 @@ dotdir_has_owning_gui_app() {
     return 1
 }
 
+# Collect Claude Code plugin name tokens (the segment before '@' in a
+# "plugin@marketplace" identifier) from the user's plugin config. Plugins own
+# state directories such as ~/.cc-safety-net without installing a matching PATH
+# binary or GUI app, so their dotdirs must not be flagged as orphans.
+hint_collect_claude_plugin_tokens() {
+    local settings="$HOME/.claude/settings.json"
+    local installed="$HOME/.claude/plugins/installed_plugins.json"
+    # `|| true` keeps a no-match grep (the common case: Claude Code installed
+    # but no plugins) from aborting under `set -euo pipefail`.
+    {
+        if [[ -f "$settings" ]]; then
+            plutil -extract enabledPlugins json -o - "$settings" 2> /dev/null |
+                LC_ALL=C grep -oE '"[A-Za-z0-9._-]+@[A-Za-z0-9._-]+"' || true
+        fi
+        if [[ -f "$installed" ]]; then
+            LC_ALL=C grep -oE '"[A-Za-z0-9._-]+@[A-Za-z0-9._-]+"' "$installed" 2> /dev/null || true
+        fi
+    } | sed -E 's/^"//; s/@.*$//' | LC_ALL=C sort -u
+}
+
+# Return 0 when a dotdir name embeds an enabled Claude Code plugin token.
+# e.g. dotdir "cc-safety-net" embeds plugin token "safety-net".
+hint_dotdir_owned_by_claude_plugin() {
+    local dotdir_name="$1"
+    local tokens="$2"
+    [[ -n "$tokens" ]] || return 1
+    local token
+    while IFS= read -r token; do
+        [[ ${#token} -ge 4 ]] || continue
+        if [[ "$dotdir_name" == *"$token"* ]]; then
+            return 0
+        fi
+    done <<< "$tokens"
+    return 1
+}
+
 # Detect ~/.<dir> directories that may belong to uninstalled CLI tools.
 # shellcheck disable=SC2329
 show_orphan_dotdir_hint_notice() {
@@ -730,6 +766,8 @@ show_orphan_dotdir_hint_notice() {
     local -a details=()
     local installed_gui_app_texts=""
     local installed_gui_app_texts_loaded=false
+    local claude_plugin_tokens=""
+    local claude_plugin_tokens_loaded=false
 
     while IFS= read -r dotdir; do
         [[ -d "$dotdir" ]] || continue
@@ -778,6 +816,14 @@ show_orphan_dotdir_hint_notice() {
         done
         [[ "$has_binary" == "true" ]] && continue
 
+        if [[ "$claude_plugin_tokens_loaded" != "true" ]]; then
+            claude_plugin_tokens=$(hint_collect_claude_plugin_tokens)
+            claude_plugin_tokens_loaded=true
+        fi
+        if hint_dotdir_owned_by_claude_plugin "$name" "$claude_plugin_tokens"; then
+            continue
+        fi
+
         if [[ "$installed_gui_app_texts_loaded" != "true" ]]; then
             installed_gui_app_texts=$(hint_collect_installed_gui_app_match_texts)
             installed_gui_app_texts_loaded=true
@@ -787,7 +833,7 @@ show_orphan_dotdir_hint_notice() {
         fi
 
         if [[ -d "$HOME/Library/LaunchAgents" ]]; then
-            if run_with_timeout 2 grep -rlq "$basename" "$HOME/Library/LaunchAgents/" 2> /dev/null; then
+            if run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" grep -rlq "$basename" "$HOME/Library/LaunchAgents/" 2> /dev/null; then
                 continue
             fi
         fi
@@ -809,7 +855,7 @@ show_orphan_dotdir_hint_notice() {
         if [[ ${#labels[@]} -ge $max_hits ]]; then
             break
         fi
-    done < <(run_with_timeout 3 find "$HOME" -maxdepth 1 -mindepth 1 -type d -name '.*' 2> /dev/null | LC_ALL=C sort)
+    done < <(run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" find "$HOME" -maxdepth 1 -mindepth 1 -type d -name '.*' 2> /dev/null | LC_ALL=C sort)
 
     [[ ${#labels[@]} -eq 0 ]] && return 0
 

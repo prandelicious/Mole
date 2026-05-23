@@ -15,7 +15,7 @@ clean_trash() {
         trash_count=$(command find "$HOME/.Trash" -mindepth 1 -maxdepth 1 -print0 2> /dev/null |
             tr -dc '\0' | wc -c | tr -d ' ' || echo "0")
     else
-        trash_count=$(run_with_timeout 3 osascript -e 'tell application "Finder" to count items in trash' 2> /dev/null) || trash_count_status=$?
+        trash_count=$(run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" osascript -e 'tell application "Finder" to count items in trash' 2> /dev/null) || trash_count_status=$?
     fi
     if [[ $trash_count_status -eq 124 ]]; then
         debug_log "Finder trash count timed out, using direct .Trash scan"
@@ -32,7 +32,7 @@ clean_trash() {
         if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
             debug_log "Skipping Finder AppleScript in test mode"
         else
-            if run_with_timeout 5 osascript -e 'tell application "Finder" to empty trash' > /dev/null 2>&1; then
+            if run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" osascript -e 'tell application "Finder" to empty trash' > /dev/null 2>&1; then
                 emptied_via_finder=true
                 echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Trash · emptied, $trash_count items"
                 note_activity
@@ -699,7 +699,7 @@ scan_external_volumes() {
         [[ -d "$volume" && -w "$volume" && ! -L "$volume" ]] || continue
         [[ "$volume" == "/" || "$volume" == "/Volumes/Macintosh HD" ]] && continue
         local protocol=""
-        protocol=$(run_with_timeout 1 command diskutil info "$volume" 2> /dev/null | grep -i "Protocol:" | awk '{print $2}' || echo "")
+        protocol=$(run_with_timeout 1 command diskutil info "$volume" 2> /dev/null | grep -i "Protocol:" | awk '{print $2}' || echo "") # 1s: volume protocol probe, see lib/core/timeouts.sh
         case "$protocol" in
             SMB | NFS | AFP | CIFS | WebDAV)
                 network_volumes+=("$volume")
@@ -707,7 +707,7 @@ scan_external_volumes() {
                 ;;
         esac
         local fs_type=""
-        fs_type=$(run_with_timeout 1 command df -T "$volume" 2> /dev/null | tail -1 | awk '{print $2}' || echo "")
+        fs_type=$(run_with_timeout 1 command df -T "$volume" 2> /dev/null | tail -1 | awk '{print $2}' || echo "") # 1s: volume FS-type probe, see lib/core/timeouts.sh
         case "$fs_type" in
             nfs | smbfs | afpfs | cifs | webdav)
                 network_volumes+=("$volume")
@@ -800,6 +800,7 @@ cache_top_level_entry_count_capped() {
         fi
     done
 
+    # eval: restore shopt state captured by $(shopt -p)
     eval "$_nullglob_state"
     eval "$_dotglob_state"
 
@@ -820,12 +821,14 @@ directory_has_entries() {
     local item
     for item in "$dir"/*; do
         if [[ -e "$item" ]]; then
+            # eval: restore shopt state captured by $(shopt -p)
             eval "$_nullglob_state"
             eval "$_dotglob_state"
             return 0
         fi
     done
 
+    # eval: restore shopt state captured by $(shopt -p)
     eval "$_nullglob_state"
     eval "$_dotglob_state"
     return 1
@@ -895,6 +898,7 @@ clean_app_caches() {
         [[ -d "$container_dir/Data/Library/Caches" ]] || continue
         process_container_cache "$container_dir"
     done
+    # eval: restore shopt state captured by $(shopt -p)
     eval "$_ng_state"
     stop_section_spinner
 
@@ -970,6 +974,7 @@ process_container_cache() {
             [[ -e "$item" ]] || continue
             safe_remove "$item" true || true
         done
+        # eval: restore shopt state captured by $(shopt -p)
         eval "$_nullglob_state"
         eval "$_dotglob_state"
     fi
@@ -1101,6 +1106,7 @@ clean_group_container_caches() {
                     fi
                 done
             fi
+            # eval: restore shopt state captured by $(shopt -p)
             eval "$_nullglob_state"
             eval "$_dotglob_state"
 
@@ -1111,6 +1117,7 @@ clean_group_container_caches() {
             fi
         done
     done
+    # eval: restore shopt state captured by $(shopt -p)
     eval "$_nullglob_state"
 
     stop_section_spinner
@@ -1205,7 +1212,7 @@ validate_external_volume_target() {
     fi
 
     local disk_info=""
-    disk_info=$(run_with_timeout 2 command diskutil info "$resolved" 2> /dev/null || echo "")
+    disk_info=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" command diskutil info "$resolved" 2> /dev/null || echo "")
     if [[ -n "$disk_info" ]]; then
         if echo "$disk_info" | grep -Eq 'Internal:[[:space:]]+Yes'; then
             echo "Refusing to clean an internal volume: $resolved" >&2
@@ -1365,8 +1372,26 @@ clean_browsers() {
             safe_clean ~/Library/Application\ Support/Arc/GrShaderCache/* "Arc GR shader cache"
             safe_clean ~/Library/Application\ Support/Arc/GraphiteDawnCache/* "Arc Dawn cache"
             safe_clean ~/Library/Application\ Support/Arc/Crashpad/completed/* "Arc crash reports"
+            safe_clean ~/Library/Application\ Support/Arc/User\ Data/*/Code\ Cache/* "Arc code cache"
+            safe_clean ~/Library/Application\ Support/Arc/User\ Data/*/GPUCache/* "Arc GPU cache"
+            safe_clean ~/Library/Application\ Support/Arc/User\ Data/*/DawnCache/* "Arc Dawn cache"
+            safe_clean ~/Library/Application\ Support/Arc/User\ Data/*/GrShaderCache/* "Arc GR shader cache"
+            safe_clean ~/Library/Application\ Support/Arc/User\ Data/*/GraphiteDawnCache/* "Arc Graphite Dawn cache"
+            safe_clean ~/Library/Application\ Support/Arc/User\ Data/ShaderCache/* "Arc shader cache"
+            safe_clean ~/Library/Application\ Support/Arc/User\ Data/GrShaderCache/* "Arc GR shader cache"
+            safe_clean ~/Library/Application\ Support/Arc/User\ Data/GraphiteDawnCache/* "Arc Dawn cache"
+            safe_clean ~/Library/Application\ Support/Arc/User\ Data/component_crx_cache/* "Arc component CRX cache"
+            safe_clean ~/Library/Application\ Support/Arc/User\ Data/extensions_crx_cache/* "Arc extensions CRX cache"
+            safe_clean ~/Library/Application\ Support/Arc/User\ Data/Crashpad/completed/* "Arc crash reports"
         fi
         for _arc_profile in "$HOME/Library/Application Support/Arc"/*/; do
+            clean_service_worker_cache "Arc" "$_arc_profile/Service Worker/CacheStorage"
+            if [[ "$_arc_running" != "true" ]]; then
+                safe_clean "$_arc_profile"/Service\ Worker/ScriptCache/* "Arc Service Worker ScriptCache"
+            fi
+        done
+        for _arc_profile in "$HOME/Library/Application Support/Arc/User Data"/*/; do
+            [[ -d "$_arc_profile" ]] || continue
             clean_service_worker_cache "Arc" "$_arc_profile/Service Worker/CacheStorage"
             if [[ "$_arc_running" != "true" ]]; then
                 safe_clean "$_arc_profile"/Service\ Worker/ScriptCache/* "Arc Service Worker ScriptCache"
@@ -1464,6 +1489,21 @@ clean_browsers() {
     clean_edge_old_versions
     clean_edge_updater_old_versions
     clean_brave_old_versions
+    # QQ Browser 3 (Chromium-based).
+    if [[ -d ~/Library/Application\ Support/QQBrowser3 ]]; then
+        safe_clean ~/Library/Caches/com.tencent.QQBrowser3/* "QQ Browser cache"
+        local _qqbrowser_running=false
+        pgrep -x "QQBrowser3" > /dev/null 2>&1 && _qqbrowser_running=true
+        if [[ "$_qqbrowser_running" != "true" ]]; then
+            safe_clean ~/Library/Application\ Support/QQBrowser3/*/Code\ Cache/* "QQ Browser code cache"
+            safe_clean ~/Library/Application\ Support/QQBrowser3/*/GPUCache/* "QQ Browser GPU cache"
+            safe_clean ~/Library/Application\ Support/QQBrowser3/ShaderCache/* "QQ Browser shader cache"
+            safe_clean ~/Library/Application\ Support/QQBrowser3/GrShaderCache/* "QQ Browser GR shader cache"
+            safe_clean ~/Library/Application\ Support/QQBrowser3/GraphiteDawnCache/* "QQ Browser Dawn cache"
+            safe_clean ~/Library/Application\ Support/QQBrowser3/component_crx_cache/* "QQ Browser component cache"
+            safe_clean ~/Library/Application\ Support/QQBrowser3/Crashpad/completed/* "QQ Browser crash reports"
+        fi
+    fi
 }
 
 # Cloud storage caches.
@@ -1848,6 +1888,7 @@ clean_application_support_logs() {
     if [[ "$pipefail_was_set" == "true" ]]; then
         set -o pipefail
     fi
+    # eval: restore shopt state captured by $(shopt -p)
     eval "$_ng_state"
     stop_section_spinner
     if [[ "$found_any" == "true" ]]; then
@@ -2057,7 +2098,7 @@ check_large_file_candidates() {
     if [[ "${SYSTEM_CLEAN:-false}" != "true" ]] && command -v tmutil > /dev/null 2>&1 &&
         defaults read /Library/Preferences/com.apple.TimeMachine AutoBackup 2> /dev/null | grep -qE '^[01]$'; then
         local snapshot_list snapshot_count
-        snapshot_list=$(run_with_timeout 3 tmutil listlocalsnapshots / 2> /dev/null || true)
+        snapshot_list=$(run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" tmutil listlocalsnapshots / 2> /dev/null || true)
         if [[ -n "$snapshot_list" ]]; then
             snapshot_count=$(echo "$snapshot_list" | { grep -Eo 'com\.apple\.TimeMachine\.[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}' || true; } | wc -l | awk '{print $1}')
             if [[ "$snapshot_count" =~ ^[0-9]+$ && "$snapshot_count" -gt 0 ]]; then
@@ -2070,7 +2111,7 @@ check_large_file_candidates() {
 
     if command -v docker > /dev/null 2>&1; then
         local docker_output
-        docker_output=$(run_with_timeout 3 docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2> /dev/null || true)
+        docker_output=$(run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2> /dev/null || true)
         if [[ -n "$docker_output" ]]; then
             echo -e "  ${YELLOW}${ICON_WARNING}${NC} Docker storage:"
             while IFS=$'\t' read -r dtype dsize dreclaim; do
@@ -2079,7 +2120,7 @@ check_large_file_candidates() {
             done <<< "$docker_output"
             found_any=true
         else
-            docker_output=$(run_with_timeout 3 docker system df 2> /dev/null || true)
+            docker_output=$(run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" docker system df 2> /dev/null || true)
             if [[ -n "$docker_output" ]]; then
                 echo -e "  ${YELLOW}${ICON_WARNING}${NC} Docker storage:"
                 echo -e "  ${GRAY}${ICON_REVIEW}${NC} ${GRAY}Run: docker system df${NC}"

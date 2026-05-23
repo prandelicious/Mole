@@ -43,8 +43,10 @@ setup_file() {
 }
 
 teardown_file() {
-	rm -rf "$HOME/.config/mole"
-	rm -rf "$HOME"
+	if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
+		rm -rf "$HOME/.config/mole"
+		rm -rf "$HOME"
+	fi
 	if [[ -n "${ORIGINAL_HOME:-}" ]]; then
 		export HOME="$ORIGINAL_HOME"
 	fi
@@ -96,6 +98,11 @@ SCRIPT
 }
 
 setup() {
+	# Safety: refuse to operate on a real home directory.
+	if [[ "$HOME" != "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
+		printf 'FATAL: HOME is not a test temp dir: %s\n' "$HOME" >&2
+		return 1
+	fi
 	rm -rf "$HOME/.config/mole"
 	mkdir -p "$HOME/.config/mole"
 }

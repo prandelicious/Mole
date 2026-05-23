@@ -18,7 +18,9 @@ setup_file() {
 }
 
 teardown_file() {
-    rm -rf "$HOME"
+    if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
+        rm -rf "$HOME"
+    fi
     if [[ -n "${ORIGINAL_HOME:-}" ]]; then
         export HOME="$ORIGINAL_HOME"
     fi
@@ -721,7 +723,7 @@ should_protect_path() { return 0; }
 
 tmp_dir="$(mktemp -d)"
 tmp_plist="$tmp_dir/com.microsoft.office.licensingV2.helper.plist"
-/usr/libexec/PlistBuddy -c "Add :Program string /Library/PrivilegedHelperTools/com.microsoft.office.licensingV2.helper" "$tmp_plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :Program string $tmp_dir/missing-protected-helper" "$tmp_plist" 2>/dev/null || true
 
 sudo() {
   if [[ "$1" == "-n" && "$2" == "true" ]]; then

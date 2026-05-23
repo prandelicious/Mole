@@ -12,13 +12,20 @@ setup_file() {
 }
 
 teardown_file() {
-    rm -rf "$HOME"
+    if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
+        rm -rf "$HOME"
+    fi
     if [[ -n "${ORIGINAL_HOME:-}" ]]; then
         export HOME="$ORIGINAL_HOME"
     fi
 }
 
 setup() {
+    # Safety: refuse to operate on a real home directory.
+    if [[ "$HOME" != "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
+        printf 'FATAL: HOME is not a test temp dir: %s\n' "$HOME" >&2
+        return 1
+    fi
     rm -rf "${HOME:?}"/*
     rm -rf "${HOME:?}"/.[!.]* "${HOME:?}"/..?* 2> /dev/null || true
     mkdir -p "$HOME/.config/mole"
@@ -313,6 +320,77 @@ EOTD
 
     [ "$status" -eq 0 ]
     [[ "$output" != *".bridge"* ]]
+}
+
+@test "show_orphan_dotdir_hint_notice skips state dir owned by an enabled Claude Code plugin (#889)" {
+    mkdir -p "$HOME/.cc-safety-net"
+    touch -t 202401010000 "$HOME/.cc-safety-net"
+
+    mkdir -p "$HOME/.claude"
+    cat > "$HOME/.claude/settings.json" <<'JSON'
+{
+  "enabledPlugins": {
+    "safety-net@cc-marketplace": true
+  }
+}
+JSON
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOTD'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/hints.sh"
+note_activity() { :; }
+run_with_timeout() { shift; "$@"; }
+hint_get_path_size_kb_with_timeout() { echo "1024"; }
+show_orphan_dotdir_hint_notice
+EOTD
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *".cc-safety-net"* ]]
+}
+
+@test "show_orphan_dotdir_hint_notice still flags a plugin-shaped dir with no enabled plugin (#889)" {
+    mkdir -p "$HOME/.cc-safety-net"
+    touch -t 202401010000 "$HOME/.cc-safety-net"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOTD'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/hints.sh"
+note_activity() { :; }
+run_with_timeout() { shift; "$@"; }
+hint_get_path_size_kb_with_timeout() { echo "1024"; }
+show_orphan_dotdir_hint_notice
+EOTD
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *".cc-safety-net"* ]]
+}
+
+@test "show_orphan_dotdir_hint_notice survives Claude config that has no plugins (#889)" {
+    mkdir -p "$HOME/.fakecli-test-orphan"
+    touch -t 202401010000 "$HOME/.fakecli-test-orphan"
+
+    # Claude Code installed but no plugins: settings.json without
+    # enabledPlugins and an installed_plugins.json with no plugin tokens.
+    # The token-collection greps match nothing here, which must not abort
+    # the hint under `set -euo pipefail`.
+    mkdir -p "$HOME/.claude/plugins"
+    echo '{"theme":"dark"}' > "$HOME/.claude/settings.json"
+    echo '{"marketplaces":{}}' > "$HOME/.claude/plugins/installed_plugins.json"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOTD'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/hints.sh"
+note_activity() { :; }
+run_with_timeout() { shift; "$@"; }
+hint_get_path_size_kb_with_timeout() { echo "1024"; }
+show_orphan_dotdir_hint_notice
+EOTD
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *".fakecli-test-orphan"* ]]
 }
 
 @test "show_orphan_dotdir_hint_notice skips dir with existing binary" {

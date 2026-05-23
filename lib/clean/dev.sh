@@ -50,8 +50,8 @@ clean_corepack_cache() {
             return 0
             ;;
     esac
-    if command -v corepack > /dev/null 2>&1 && run_with_timeout 2 corepack --version > /dev/null 2>&1; then
-        clean_tool_cache "Corepack cache" "$corepack_home" run_with_timeout 20 corepack cache clean
+    if command -v corepack > /dev/null 2>&1 && run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" corepack --version > /dev/null 2>&1; then
+        clean_tool_cache "Corepack cache" "$corepack_home" run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" corepack cache clean
     else
         safe_clean "$corepack_home"/* "Corepack cache"
     fi
@@ -59,13 +59,13 @@ clean_corepack_cache() {
 
 clean_uv_cache() {
     local uv_cache_path="$HOME/.cache/uv"
-    if command -v uv > /dev/null 2>&1 && run_with_timeout 2 uv --version > /dev/null 2>&1; then
+    if command -v uv > /dev/null 2>&1 && run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" uv --version > /dev/null 2>&1; then
         local detected_cache
-        detected_cache=$(run_with_timeout 2 uv cache dir 2> /dev/null || true)
+        detected_cache=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" uv cache dir 2> /dev/null || true)
         if [[ -n "$detected_cache" && "$detected_cache" == /* ]]; then
             uv_cache_path="$detected_cache"
         fi
-        clean_tool_cache "uv cache" "$uv_cache_path" run_with_timeout 20 uv cache prune
+        clean_tool_cache "uv cache" "$uv_cache_path" run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" uv cache prune
     else
         safe_clean "$uv_cache_path"/* "uv cache"
     fi
@@ -100,9 +100,9 @@ clean_conda_metadata_caches() {
     fi
 
     local conda_cache_hint="$HOME/.conda/pkgs"
-    if command -v conda > /dev/null 2>&1 && run_with_timeout 2 conda --version > /dev/null 2>&1; then
+    if command -v conda > /dev/null 2>&1 && run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" conda --version > /dev/null 2>&1; then
         clean_tool_cache "conda index/tarball/log caches" "$conda_cache_hint" \
-            run_with_timeout 30 conda clean --yes --index-cache --tarballs --logfiles
+            run_with_timeout "$MOLE_TIMEOUT_DISK_VERIFY_SEC" conda clean --yes --index-cache --tarballs --logfiles
         note_activity
         return 0
     fi
@@ -127,7 +127,7 @@ clean_dev_npm() {
 
     if command -v npm > /dev/null 2>&1; then
         start_section_spinner "Checking npm cache path..."
-        npm_cache_path=$(run_with_timeout 2 npm config get cache 2> /dev/null) || npm_cache_path=""
+        npm_cache_path=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" npm config get cache 2> /dev/null) || npm_cache_path=""
         stop_section_spinner
 
         if [[ -z "$npm_cache_path" || "$npm_cache_path" != /* ]]; then
@@ -171,14 +171,14 @@ clean_dev_npm() {
     if command -v pnpm > /dev/null 2>&1 && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm --version > /dev/null 2>&1; then
         local pnpm_store_path
         start_section_spinner "Checking store path..."
-        pnpm_store_path=$(COREPACK_ENABLE_DOWNLOAD_PROMPT=0 run_with_timeout 2 pnpm store path 2> /dev/null) || pnpm_store_path=""
+        pnpm_store_path=$(COREPACK_ENABLE_DOWNLOAD_PROMPT=0 run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" pnpm store path 2> /dev/null) || pnpm_store_path=""
         stop_section_spinner
 
         local pnpm_cache_check="$pnpm_default_store"
         if [[ -n "$pnpm_store_path" && "$pnpm_store_path" == /* ]]; then
             pnpm_cache_check="$pnpm_store_path"
         fi
-        COREPACK_ENABLE_DOWNLOAD_PROMPT=0 clean_tool_cache "pnpm cache" "$pnpm_cache_check" run_with_timeout 20 pnpm store prune
+        COREPACK_ENABLE_DOWNLOAD_PROMPT=0 clean_tool_cache "pnpm cache" "$pnpm_cache_check" run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" pnpm store prune
     else
         debug_log "pnpm is unavailable, leaving global pnpm store for manual review: $pnpm_default_store"
     fi
@@ -189,7 +189,7 @@ clean_dev_npm() {
     local bun_dry_run="${DRY_RUN:-false}"
     if command -v bun > /dev/null 2>&1 && bun --version > /dev/null 2>&1; then
         if [[ -t 1 ]]; then start_section_spinner "Checking bun cache path..."; fi
-        bun_cache_path=$(run_with_timeout 2 bun pm cache 2> /dev/null) || bun_cache_path=""
+        bun_cache_path=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" bun pm cache 2> /dev/null) || bun_cache_path=""
         if [[ -t 1 ]]; then stop_section_spinner; fi
 
         if [[ -z "$bun_cache_path" || "$bun_cache_path" != /* ]]; then
@@ -210,7 +210,7 @@ clean_dev_npm() {
             if [[ -t 1 ]]; then
                 start_section_spinner "Cleaning bun cache..."
             fi
-            if run_with_timeout 10 bun pm cache rm > /dev/null 2>&1; then
+            if run_with_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" bun pm cache rm > /dev/null 2>&1; then
                 bun_cache_cleaned=true
             fi
             if [[ -t 1 ]]; then
@@ -256,7 +256,7 @@ clean_dev_python() {
     # Check pip3 is functional (not just macOS stub that triggers CLT install dialog)
     if command -v pip3 > /dev/null 2>&1 && pip3 --version > /dev/null 2>&1; then
         local pip_cache_path
-        pip_cache_path=$(run_with_timeout 2 pip3 cache dir 2> /dev/null) || pip_cache_path=""
+        pip_cache_path=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" pip3 cache dir 2> /dev/null) || pip_cache_path=""
         if [[ -z "$pip_cache_path" || "$pip_cache_path" != /* ]]; then
             pip_cache_path="$HOME/Library/Caches/pip"
         fi
@@ -317,7 +317,7 @@ get_mise_cache_path() {
 
     if command -v mise > /dev/null 2>&1; then
         local mise_cache_path
-        mise_cache_path=$(run_with_timeout 2 mise cache path 2> /dev/null || echo "")
+        mise_cache_path=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" mise cache path 2> /dev/null || echo "")
         if [[ -n "$mise_cache_path" && "$mise_cache_path" == /* ]]; then
             echo "$mise_cache_path"
             return 0
@@ -863,11 +863,11 @@ clean_dev_mobile() {
                 simctl_probe_ok=true
             fi
         else
-            if run_with_timeout 5 xcrun simctl list devices > /dev/null 2>&1; then
+            if run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" xcrun simctl list devices > /dev/null 2>&1; then
                 simctl_probe_ok=true
             else
                 sleep 1
-                if run_with_timeout 8 xcrun simctl list devices > /dev/null 2>&1; then
+                if run_with_timeout 8 xcrun simctl list devices > /dev/null 2>&1; then # 8s: simctl retry after warmup, see lib/core/timeouts.sh
                     simctl_probe_ok=true
                     debug_log "simctl probe succeeded on retry (CoreSimulatorService warmup)"
                 else
@@ -1353,6 +1353,23 @@ codex_desktop_running() {
     return 1
 }
 
+# True when the Codex CLI or the Codex Desktop app is running.
+codex_running() {
+    command -v pgrep > /dev/null 2>&1 || return 1
+    pgrep -x "codex" > /dev/null 2>&1 && return 0
+    codex_desktop_running
+}
+
+antigravity_or_gemini_running() {
+    command -v pgrep > /dev/null 2>&1 || return 1
+
+    pgrep -x "Antigravity" > /dev/null 2>&1 && return 0
+    pgrep -f "/Antigravity.app/" > /dev/null 2>&1 && return 0
+    pgrep -x "gemini" > /dev/null 2>&1 && return 0
+    pgrep -f "antigravity-browser-profile" > /dev/null 2>&1 && return 0
+    return 1
+}
+
 is_codex_runtime_active() {
     local runtime_dir="$1"
     [[ -d "$runtime_dir" ]] || return 1
@@ -1445,6 +1462,50 @@ clean_codex_runtimes() {
     done < <(command find "$runtime_root" -mindepth 1 -maxdepth 1 -type d -print0 2> /dev/null)
 }
 
+# Codex CLI working directory: rebuildable cache, temp, and log files.
+# Conversation state (sessions, *.sqlite, history.jsonl, credentials) is
+# intentionally left untouched - see issue #913.
+clean_codex_cli() {
+    local codex_root="$HOME/.codex"
+    [[ -d "$codex_root" ]] || return 0
+
+    if codex_running; then
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Codex CLI caches · skipped (Codex running)"
+        note_activity
+        return 0
+    fi
+
+    safe_clean "$codex_root/cache"/* "Codex CLI cache"
+    safe_clean "$codex_root/.tmp"/* "Codex CLI temp files"
+    safe_clean "$codex_root/log"/* "Codex CLI logs"
+}
+
+# Antigravity (Gemini) keeps a full Chromium profile under
+# ~/.gemini/antigravity-browser-profile. Clean its regenerable browser
+# caches, mirroring the Antigravity Electron cache cleanup in clean_dev_misc.
+clean_antigravity_caches() {
+    local ag_profile="$HOME/.gemini/antigravity-browser-profile"
+
+    if antigravity_or_gemini_running; then
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Antigravity/Gemini caches · skipped (Antigravity or Gemini running)"
+        note_activity
+        return 0
+    fi
+
+    if [[ -d "$ag_profile" ]]; then
+        safe_clean "$ag_profile/Default/Cache"/* "Antigravity browser cache"
+        safe_clean "$ag_profile/Default/Code Cache"/* "Antigravity code cache"
+        safe_clean "$ag_profile/Default/GPUCache"/* "Antigravity GPU cache"
+        safe_clean "$ag_profile/Default/DawnGraphiteCache"/* "Antigravity Dawn cache"
+        safe_clean "$ag_profile/Default/DawnWebGPUCache"/* "Antigravity WebGPU cache"
+        safe_clean "$ag_profile/GraphiteDawnCache"/* "Antigravity Graphite cache"
+        safe_clean "$ag_profile/component_crx_cache"/* "Antigravity component cache"
+        safe_clean "$ag_profile/extensions_crx_cache"/* "Antigravity extension cache"
+        clean_service_worker_cache "Antigravity" "$ag_profile/Default/Service Worker/CacheStorage"
+    fi
+    safe_clean "$HOME/.gemini/tmp"/* "Gemini CLI temp files"
+}
+
 # Misc dev tool caches.
 clean_dev_misc() {
     safe_clean ~/Library/Caches/com.unity3d.*/* "Unity cache"
@@ -1461,6 +1522,8 @@ clean_dev_misc() {
         safe_clean ~/Library/Application\ Support/Antigravity/DawnGraphiteCache/* "Antigravity Dawn cache"
         safe_clean ~/Library/Application\ Support/Antigravity/DawnWebGPUCache/* "Antigravity WebGPU cache"
     fi
+    # Antigravity browser profile caches (~/.gemini)
+    clean_antigravity_caches
     # Filo (Electron)
     if [[ -d ~/Library/Application\ Support/Filo ]]; then
         safe_clean ~/Library/Application\ Support/Filo/production/Cache/* "Filo cache"
@@ -1501,6 +1564,8 @@ clean_dev_misc() {
     fi
     # Codex Desktop runtimes contain active Node/Python dependencies.
     clean_codex_runtimes
+    # Codex CLI working-directory caches (~/.codex)
+    clean_codex_cli
     # Cursor Agent session logs (versions cleaned separately in clean_dev_ai_agents)
     [[ -d "$HOME/.local/share/cursor-agent" ]] && safe_find_delete "$HOME/.local/share/cursor-agent" "*.log" "$MOLE_LOG_AGE_DAYS" "f"
     # Playwright cached browser binaries

@@ -10,6 +10,14 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$PROJECT_ROOT"
 
+# Sweep orphaned per-test HOME dirs left behind by killed bats runs.
+# Normal teardown removes them; this only catches the ones that escaped.
+# 60-minute threshold avoids racing with a long-running test in progress.
+if [[ -d "$PROJECT_ROOT/tests" ]]; then
+    find "$PROJECT_ROOT/tests" -maxdepth 1 -type d -name 'tmp-*' -mmin +60 \
+        -exec rm -rf {} + 2> /dev/null || true # SAFE: confined to tests/tmp-*
+fi
+
 # Never allow the scripted test run to trigger real sudo or Touch ID prompts.
 export MOLE_TEST_NO_AUTH=1
 
@@ -306,8 +314,8 @@ echo "3. Running Go tests..."
 if command -v go > /dev/null 2>&1; then
     mkdir -p "$GO_TEST_CACHE"
     if GOCACHE="$GO_TEST_CACHE" go build ./... > /dev/null 2>&1 &&
-        GOCACHE="$GO_TEST_CACHE" go vet ./cmd/... > /dev/null 2>&1 &&
-        GOCACHE="$GO_TEST_CACHE" go test ./cmd/... > /dev/null 2>&1; then
+        GOCACHE="$GO_TEST_CACHE" go vet ./... > /dev/null 2>&1 &&
+        GOCACHE="$GO_TEST_CACHE" go test ./... > /dev/null 2>&1; then
         printf "${GREEN}${ICON_SUCCESS} Go tests passed${NC}\n"
     else
         printf "${RED}${ICON_ERROR} Go tests failed${NC}\n"

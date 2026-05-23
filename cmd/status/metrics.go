@@ -134,6 +134,7 @@ type GPUStatus struct {
 type MemoryStatus struct {
 	Used        uint64  `json:"used"`
 	Total       uint64  `json:"total"`
+	Available   uint64  `json:"available"`
 	UsedPercent float64 `json:"used_percent"`
 	SwapUsed    uint64  `json:"swap_used"`
 	SwapTotal   uint64  `json:"swap_total"`
@@ -310,7 +311,7 @@ func (c *Collector) Collect() (MetricsSnapshot, error) {
 	var trashApprox bool
 	collect(func() (err error) { trashSize, trashApprox = collectTrashSize(); return nil })
 	collect(func() (err error) { diskIO = c.collectDiskIO(now); return nil })
-	collect(func() (err error) { netStats, err = c.collectNetwork(now); return })
+	collect(func() (err error) { netStats = c.collectNetwork(now); return nil })
 	collect(func() (err error) { proxyStats = collectProxy(); return nil })
 	collect(func() (err error) { batteryStats, _ = collectBatteries(); return nil })
 	collect(func() (err error) { thermalStats = collectThermal(); return nil })

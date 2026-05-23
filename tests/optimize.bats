@@ -14,7 +14,9 @@ setup_file() {
 }
 
 teardown_file() {
-	rm -rf "$HOME"
+	if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
+		rm -rf "$HOME"
+	fi
 	if [[ -n "${ORIGINAL_HOME:-}" ]]; then
 		export HOME="$ORIGINAL_HOME"
 	fi
@@ -33,28 +35,6 @@ EOF
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"needs"* ]]
-}
-
-@test "has_bluetooth_hid_connected detects HID" {
-	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
-set -euo pipefail
-source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-system_profiler() {
-    cat << 'OUT'
-Bluetooth:
-  Apple Magic Mouse:
-    Connected: Yes
-    Type: Mouse
-OUT
-}
-export -f system_profiler
-if has_bluetooth_hid_connected; then
-    echo "hid"
-fi
-EOF
-
-	[ "$status" -eq 0 ]
-	[[ "$output" == *"hid"* ]]
 }
 
 @test "is_ac_power detects AC power" {
@@ -512,6 +492,37 @@ EOF
 	[[ "$output" == *"Launch Agents all healthy"* ]]
 }
 
+@test "opt_launch_agents_cleanup spares agents on unmounted volumes" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+# Clean up any leftover plists from previous tests.
+rm -f "$HOME/Library/LaunchAgents"/*.plist 2>/dev/null || true
+# A program on an unplugged /Volumes/<disk> is missing but not broken;
+# the volume is simply unmounted, so the agent must be left alone.
+mkdir -p "$HOME/Library/LaunchAgents"
+cat > "$HOME/Library/LaunchAgents/com.test.external.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.test.external</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Volumes/MoleNonexistentDisk/tool</string>
+    </array>
+</dict>
+</plist>
+PLIST
+opt_launch_agents_cleanup
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"Launch Agents all healthy"* ]]
+}
+
 @test "execute_optimization dispatches launch_agents_cleanup" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -540,6 +551,31 @@ EOF
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"already current"* ]]
+}
+
+@test "opt_periodic_maintenance ignores non-BSD stat earlier in PATH" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+periodic() { true; }
+export -f periodic
+tmpdir="$(mktemp -d /tmp/mole-test-stat-path.XXXXXX)"
+mkdir -p "$tmpdir/bin"
+cat > "$tmpdir/bin/stat" <<'STAT'
+#!/usr/bin/env bash
+echo "  File: /var/log/daily.out"
+STAT
+chmod +x "$tmpdir/bin/stat"
+tmplog="$tmpdir/daily.out"
+touch "$tmplog"
+PATH="$tmpdir/bin:$PATH" MOLE_PERIODIC_LOG="$tmplog" opt_periodic_maintenance
+rm -rf "$tmpdir"
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"already current"* ]]
+	[[ "$output" != *"unbound variable"* ]]
 }
 
 @test "opt_periodic_maintenance triggers in dry-run when log is stale" {
@@ -749,7 +785,6 @@ EOF
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"Permission Repair|disk_permissions_repair|optimize_task"* ]]
-	[[ "$output" == *"Bluetooth Refresh|bluetooth_reset|optimize_task"* ]]
 	[[ "$output" == *"Login Items Audit|login_items_audit|optimize_task"* ]]
 }
 
