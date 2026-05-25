@@ -225,6 +225,83 @@ EOF
 	[ "$status" -eq 0 ]
 }
 
+@test "batch_uninstall_applications blocks official-uninstaller apps" {
+	mkdir -p "$HOME/Applications/Falcon.app"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+
+start_inline_spinner() { :; }
+stop_inline_spinner() { :; }
+mole_delete() { echo "MOLE_DELETE:$1"; return 0; }
+
+selected_apps=("0|$HOME/Applications/Falcon.app|Falcon|com.crowdstrike.falcon.UserAgent|0|Never")
+files_cleaned=0
+total_items=0
+total_size_cleaned=0
+
+if batch_uninstall_applications; then
+	exit 1
+fi
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"requires the official CrowdStrike uninstaller"* ]]
+	[[ "$output" != *"MOLE_DELETE"* ]]
+}
+
+@test "batch_uninstall_applications keeps system remnants review-only" {
+	mkdir -p "$HOME/Applications/ReviewOnly.app" "$HOME/system"
+	touch "$HOME/system/com.example.review.helper"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+
+request_sudo_access() { return 0; }
+start_inline_spinner() { :; }
+stop_inline_spinner() { :; }
+enter_alt_screen() { :; }
+leave_alt_screen() { :; }
+hide_cursor() { :; }
+show_cursor() { :; }
+remove_apps_from_dock() { :; }
+pgrep() { return 1; }
+pkill() { return 0; }
+get_file_owner() { whoami; }
+get_path_size_kb() { echo "1"; }
+calculate_total_size() { echo "1"; }
+find_app_files() { :; }
+find_app_system_files() { printf '%s\n' "$HOME/system/com.example.review.helper"; }
+get_diagnostic_report_paths_for_app() { :; }
+remove_file_list() {
+	printf 'REMOVE_LIST:%s:%s\n' "${2:-false}" "$1" >> "$HOME/remove.log"
+	return 0
+}
+mole_delete() {
+	printf 'MOLE_DELETE:%s:%s\n' "$2" "$1" >> "$HOME/remove.log"
+	rm -rf "$1"
+	return 0
+}
+
+selected_apps=("0|$HOME/Applications/ReviewOnly.app|ReviewOnly|com.example.review|0|Never")
+files_cleaned=0
+total_items=0
+total_size_cleaned=0
+
+printf '\n' | batch_uninstall_applications > "$HOME/output.log" 2>&1
+
+grep -q "Review only: $HOME/system/com.example.review.helper" "$HOME/output.log"
+! grep -q "$HOME/system/com.example.review.helper" "$HOME/remove.log"
+[[ -e "$HOME/system/com.example.review.helper" ]]
+EOF
+
+	[ "$status" -eq 0 ]
+}
+
 @test "batch_uninstall_applications dry-run does not report expected leftovers as failures" {
 	create_app_artifacts
 
@@ -275,7 +352,7 @@ EOF
 	[ "$status" -eq 0 ]
 }
 
-@test "force_kill_app sends only an AppleScript Quit, never a kill signal" {
+@test "force_kill_app skips the kill ladder when Quit succeeds" {
 	# run_with_timeout invokes its argv via gtimeout/timeout, which exec the
 	# real binary and bypass bash functions, so we shadow osascript via a
 	# real script on PATH and read the trace it writes.
@@ -343,6 +420,78 @@ EOF
 	if grep -q '^pkill ' "$trace"; then
 		echo "WRONG: pkill ran even though Quit succeeded"; cat "$trace"; return 1
 	fi
+}
+
+@test "force_kill_app escalates to pkill when Quit does not land" {
+	# Process keeps showing up in pgrep until pkill -9 fires, exercising the
+	# SIGTERM and SIGKILL rungs of the escalation ladder.
+	stubdir="$HOME/stubs"
+	mkdir -p "$stubdir"
+	trace="$HOME/kill_escalate_trace.log"
+	: > "$trace"
+
+	cat > "$stubdir/osascript" <<STUB
+#!/bin/bash
+printf 'osascript %s\n' "\$*" >> "$trace"
+exit 0
+STUB
+	chmod +x "$stubdir/osascript"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" PATH="$stubdir:$PATH" \
+		TRACE_PATH="$trace" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+
+app_path="$HOME/Applications/StubbornApp.app"
+mkdir -p "$app_path/Contents"
+cat > "$app_path/Contents/Info.plist" << 'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>StubbornApp</string>
+  <key>CFBundleIdentifier</key><string>com.example.StubbornApp</string>
+</dict></plist>
+PLIST
+
+# Stays alive until SIGKILL lands, then disappears.
+sigkill_seen=0
+pgrep() {
+	if [[ $sigkill_seen -eq 1 ]]; then
+		return 1
+	fi
+	echo 12345
+	return 0
+}
+export -f pgrep
+
+pkill() {
+	printf 'pkill %s\n' "$*" >> "$TRACE_PATH"
+	for arg in "$@"; do
+		if [[ "$arg" == "-9" ]]; then
+			sigkill_seen=1
+		fi
+	done
+	return 0
+}
+export -f pkill
+export sigkill_seen
+
+sudo() { return 1; }
+export -f sudo
+
+sleep() { :; }
+export -f sleep
+
+unset MOLE_TEST_MODE MOLE_TEST_NO_AUTH
+
+force_kill_app "StubbornApp" "$app_path"
+EOF
+
+	[ "$status" -eq 0 ]
+	grep -q '^pkill -x StubbornApp' "$trace" \
+		|| { echo "WRONG: SIGTERM rung did not fire"; cat "$trace"; return 1; }
+	grep -q '^pkill -9 -x StubbornApp' "$trace" \
+		|| { echo "WRONG: SIGKILL rung did not fire"; cat "$trace"; return 1; }
 }
 
 @test "force_kill_app rejects unsafe bundle id in AppleScript Quit target" {
@@ -481,6 +630,10 @@ source "$PROJECT_ROOT/lib/uninstall/batch.sh"
 trace="$HOME/trace.log"
 launchctl() {
 	printf 'launchctl %s\n' "$*" >> "$trace"
+}
+run_with_timeout() {
+	shift
+	"$@"
 }
 safe_remove() {
 	printf 'safe_remove %s\n' "$*" >> "$trace"
@@ -768,7 +921,7 @@ EOF
 }
 
 @test "cached uninstall metadata is rejected when the app is background-only" {
-	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 eval "$(sed -n '/^uninstall_resolve_bundle_id()/,/^uninstall_app_inventory_fingerprint()/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
@@ -792,6 +945,37 @@ if uninstall_resolve_eligible_bundle_id "$app_path" "com.example.Helper" > /dev/
     echo "background-only app should not be eligible" >&2
     exit 1
 fi
+EOF
+
+	[ "$status" -eq 0 ]
+}
+
+@test "OneDrive Mac App Store bundle is eligible even when marked background-only" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+eval "$(sed -n '/^uninstall_resolve_bundle_id()/,/^uninstall_app_inventory_fingerprint()/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
+
+app_path="$HOME/Applications/OneDrive.app"
+mkdir -p "$app_path/Contents"
+cat > "$app_path/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.microsoft.OneDrive-mac</string>
+    <key>LSBackgroundOnly</key>
+    <true/>
+</dict>
+</plist>
+PLIST
+
+result=$(uninstall_resolve_eligible_bundle_id "$app_path" "")
+[[ "$result" == "com.microsoft.OneDrive-mac" ]] || {
+    echo "unexpected bundle id: $result" >&2
+    exit 1
+}
 EOF
 
 	[ "$status" -eq 0 ]
@@ -1594,4 +1778,60 @@ INNER
 	[ "$status" -eq 0 ]
 	[[ "$output" == *'"uninstall_name": "visual-studio-code"'* ]]
 	[[ "$output" == *'"source": "Homebrew"'* ]]
+}
+
+# Regression tests for #940: detect Background Items left behind after uninstall.
+_btm_helper_runner() {
+	HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+		BTM_DUMP="$1" DETAIL="$2" SUCCESS_PATH="$3" \
+		bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+_uninstall_match_btm_leftovers "$BTM_DUMP" "$DETAIL" -- "$SUCCESS_PATH"
+EOF
+}
+
+@test "_uninstall_match_btm_leftovers reports bundle id still in BTM dump" {
+	local detail="Paste|/Applications/Paste.app|com.wiheads.paste|0|||false|false|false||||"
+	local dump=$'Record #1\n  name: Paste\n  bundleID: com.wiheads.paste\n  url: file:///Applications/Paste.app/'
+
+	result="$(_btm_helper_runner "$dump" "$detail" "/Applications/Paste.app")"
+
+	[ "$result" = "Paste" ]
+}
+
+@test "_uninstall_match_btm_leftovers stays silent when bundle id is absent" {
+	local detail="Paste|/Applications/Paste.app|com.wiheads.paste|0|||false|false|false||||"
+	local dump=$'Record #1\n  name: SomethingElse\n  bundleID: com.example.other'
+
+	result="$(_btm_helper_runner "$dump" "$detail" "/Applications/Paste.app")"
+
+	[ -z "$result" ]
+}
+
+@test "_uninstall_match_btm_leftovers skips apps that were not successfully removed" {
+	local detail="Paste|/Applications/Paste.app|com.wiheads.paste|0|||false|false|false||||"
+	local dump=$'Record #1\n  bundleID: com.wiheads.paste'
+
+	result="$(_btm_helper_runner "$dump" "$detail" "/Applications/OtherApp.app")"
+
+	[ -z "$result" ]
+}
+
+@test "_uninstall_match_btm_leftovers ignores unknown bundle id" {
+	local detail="Paste|/Applications/Paste.app|unknown|0|||false|false|false||||"
+	local dump=$'Record #1\n  bundleID: unknown'
+
+	result="$(_btm_helper_runner "$dump" "$detail" "/Applications/Paste.app")"
+
+	[ -z "$result" ]
+}
+
+@test "_uninstall_match_btm_leftovers returns empty for empty dump" {
+	local detail="Paste|/Applications/Paste.app|com.wiheads.paste|0|||false|false|false||||"
+
+	result="$(_btm_helper_runner "" "$detail" "/Applications/Paste.app")"
+
+	[ -z "$result" ]
 }

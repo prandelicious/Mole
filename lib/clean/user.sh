@@ -8,51 +8,46 @@ clean_trash() {
     fi
     stop_section_spinner
 
+    # Always count and delete directly. The previous Finder AppleScript path
+    # triggered macOS's "Show warning before emptying the Trash" dialog and
+    # blocked mo clean on user confirmation. Volume Trashes
+    # (/Volumes/*/.Trashes/<uid>/) are not handled here; mo clean only manages
+    # the user's home Trash.
     local trash_count
-    local trash_count_status=0
-    # Skip AppleScript during tests to avoid permission dialogs
-    if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
-        trash_count=$(command find "$HOME/.Trash" -mindepth 1 -maxdepth 1 -print0 2> /dev/null |
-            tr -dc '\0' | wc -c | tr -d ' ' || echo "0")
-    else
-        trash_count=$(run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" osascript -e 'tell application "Finder" to count items in trash' 2> /dev/null) || trash_count_status=$?
-    fi
-    if [[ $trash_count_status -eq 124 ]]; then
-        debug_log "Finder trash count timed out, using direct .Trash scan"
-        trash_count=$(command find "$HOME/.Trash" -mindepth 1 -maxdepth 1 -print0 2> /dev/null |
-            tr -dc '\0' | wc -c | tr -d ' ' || echo "0")
-    fi
+    trash_count=$(command find "$HOME/.Trash" -mindepth 1 -maxdepth 1 -print0 2> /dev/null |
+        tr -dc '\0' | wc -c | tr -d ' ' || echo "0")
     [[ "$trash_count" =~ ^[0-9]+$ ]] || trash_count="0"
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        [[ $trash_count -gt 0 ]] && echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Trash · would empty, $trash_count items" || echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Trash · already empty"
-    elif [[ $trash_count -gt 0 ]]; then
-        local emptied_via_finder=false
-        # Skip AppleScript during tests to avoid permission dialogs
-        if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
-            debug_log "Skipping Finder AppleScript in test mode"
+        if [[ $trash_count -gt 0 ]]; then
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Trash · would empty, $trash_count items"
         else
-            if run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" osascript -e 'tell application "Finder" to empty trash' > /dev/null 2>&1; then
-                emptied_via_finder=true
-                echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Trash · emptied, $trash_count items"
-                note_activity
-            fi
+            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Trash · already empty"
         fi
-        if [[ "$emptied_via_finder" != "true" ]]; then
-            debug_log "Finder trash empty failed or timed out, falling back to direct deletion"
-            local cleaned_count=0
-            while IFS= read -r -d '' item; do
-                if safe_remove "$item" true; then
-                    cleaned_count=$((cleaned_count + 1))
-                fi
-            done < <(command find "$HOME/.Trash" -mindepth 1 -maxdepth 1 -print0 2> /dev/null || true)
-            if [[ $cleaned_count -gt 0 ]]; then
-                echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Trash · emptied, $cleaned_count items"
-                note_activity
-            fi
-        fi
-    else
+        return 0
+    fi
+
+    if [[ $trash_count -eq 0 ]]; then
         echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Trash · already empty"
+        return 0
+    fi
+
+    if [[ -t 1 ]]; then
+        MOLE_SPINNER_PREFIX="  " start_inline_spinner "Emptying trash, ${trash_count} items..."
+    fi
+
+    local cleaned_count=0
+    while IFS= read -r -d '' item; do
+        if safe_remove "$item" true; then
+            cleaned_count=$((cleaned_count + 1))
+        fi
+    done < <(command find "$HOME/.Trash" -mindepth 1 -maxdepth 1 -print0 2> /dev/null || true)
+
+    [[ -t 1 ]] && stop_inline_spinner
+
+    if [[ $cleaned_count -gt 0 ]]; then
+        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Trash · emptied, $cleaned_count items"
+        note_activity
     fi
 }
 
@@ -232,6 +227,14 @@ _clean_darwin_user_runtime_dir() {
     local found_any=false
     local item
 
+    # Per-item should_protect_path / is_path_whitelisted are intentionally
+    # skipped here. _darwin_user_runtime_dir_is_safe has already vetted the
+    # parent (must be DARWIN_USER_TEMP_DIR or DARWIN_USER_CACHE_DIR, owned by
+    # the current UID), find narrows to -user "$current_uid" -mtime +N and
+    # excludes state files (sqlite/db/plist), and safe_remove still routes
+    # through validate_path_for_deletion. For 1500 capped items that drops
+    # ~3000 per-item subshells; on a 20k-item TMPDIR this is the difference
+    # between a 30s stall and an under-3s pass.
     while IFS= read -r -d '' item; do
         [[ -e "$item" && ! -L "$item" ]] || continue
         case "$item" in
@@ -239,9 +242,6 @@ _clean_darwin_user_runtime_dir() {
                 continue
                 ;;
         esac
-        if should_protect_path "$item" 2> /dev/null || is_path_whitelisted "$item" 2> /dev/null; then
-            continue
-        fi
 
         local item_size_kb=0
         item_size_kb=$(get_path_size_kb "$item" 2> /dev/null || echo "0")
@@ -267,9 +267,6 @@ _clean_darwin_user_runtime_dir() {
     if [[ "$count" -lt "$max_items" ]]; then
         while IFS= read -r -d '' item; do
             [[ -d "$item" && ! -L "$item" ]] || continue
-            if should_protect_path "$item" 2> /dev/null || is_path_whitelisted "$item" 2> /dev/null; then
-                continue
-            fi
             if [[ "${DRY_RUN:-false}" == "true" ]] || safe_remove "$item" true "0" > /dev/null 2>&1; then
                 found_any=true
                 count=$((count + 1))
@@ -315,7 +312,12 @@ _clean_darwin_user_runtime_dirs() {
     cache_dir=$(getconf DARWIN_USER_CACHE_DIR 2> /dev/null || true)
 
     _clean_darwin_user_runtime_dir "$temp_dir" "temp" "Darwin user temp files"
+    # _clean_darwin_user_runtime_dir stops the section spinner before printing
+    # its result line; restart it so the user does not see a silent gap while
+    # the cache scan and subsequent trash empty are running.
+    start_section_spinner "Cleaning runtime files..."
     _clean_darwin_user_runtime_dir "$cache_dir" "cache" "Darwin user cache files"
+    start_section_spinner "Cleaning runtime files..."
 }
 
 # Remove old Google Chrome versions while keeping Current.
@@ -1324,9 +1326,10 @@ clean_browsers() {
     safe_clean ~/Library/Caches/com.apple.Safari/* "Safari cache"
     # Chrome/Chromium.
     safe_clean ~/Library/Caches/Google/Chrome/* "Chrome cache"
-    # Skip ScriptCache wipe while the browser is running: removing V8 bytecode
-    # under a live Chromium process breaks loaded MV3 extension service workers
-    # until the user toggles them in chrome://extensions. See #785.
+    # Do not clean Chromium Service Worker ScriptCache. Even when the browser is
+    # closed, removing MV3 extension bytecode can break extension service
+    # workers and trigger security warnings during dry-run scans. See #785,
+    # #964, and #968.
     local _chrome_running=false
     pgrep -x "Google Chrome" > /dev/null 2>&1 && _chrome_running=true
     if [[ "$_chrome_running" != "true" ]]; then
@@ -1347,9 +1350,6 @@ clean_browsers() {
     local _chrome_profile
     for _chrome_profile in "$HOME/Library/Application Support/Google/Chrome"/*/; do
         clean_service_worker_cache "Chrome" "$_chrome_profile/Service Worker/CacheStorage"
-        if [[ "$_chrome_running" != "true" ]]; then
-            safe_clean "$_chrome_profile"/Service\ Worker/ScriptCache/* "Chrome Service Worker ScriptCache"
-        fi
     done
     safe_clean ~/Library/Application\ Support/Google/GoogleUpdater/crx_cache/* "GoogleUpdater CRX cache"
     safe_clean ~/Library/Application\ Support/Google/GoogleUpdater/*.old "GoogleUpdater old files"
@@ -1386,16 +1386,10 @@ clean_browsers() {
         fi
         for _arc_profile in "$HOME/Library/Application Support/Arc"/*/; do
             clean_service_worker_cache "Arc" "$_arc_profile/Service Worker/CacheStorage"
-            if [[ "$_arc_running" != "true" ]]; then
-                safe_clean "$_arc_profile"/Service\ Worker/ScriptCache/* "Arc Service Worker ScriptCache"
-            fi
         done
         for _arc_profile in "$HOME/Library/Application Support/Arc/User Data"/*/; do
             [[ -d "$_arc_profile" ]] || continue
             clean_service_worker_cache "Arc" "$_arc_profile/Service Worker/CacheStorage"
-            if [[ "$_arc_running" != "true" ]]; then
-                safe_clean "$_arc_profile"/Service\ Worker/ScriptCache/* "Arc Service Worker ScriptCache"
-            fi
         done
     fi
     safe_clean ~/Library/Caches/company.thebrowser.dia/* "Dia cache"
@@ -1419,9 +1413,6 @@ clean_browsers() {
         fi
         for _brave_profile in "$HOME/Library/Application Support/BraveSoftware/Brave-Browser"/*/; do
             clean_service_worker_cache "Brave" "$_brave_profile/Service Worker/CacheStorage"
-            if [[ "$_brave_running" != "true" ]]; then
-                safe_clean "$_brave_profile"/Service\ Worker/ScriptCache/* "Brave Service Worker ScriptCache"
-            fi
         done
     fi
     # Helium Browser.
@@ -1472,9 +1463,6 @@ clean_browsers() {
         fi
         for _vivaldi_profile in "$HOME/Library/Application Support/Vivaldi"/*/; do
             clean_service_worker_cache "Vivaldi" "$_vivaldi_profile/Service Worker/CacheStorage"
-            if [[ "$_vivaldi_running" != "true" ]]; then
-                safe_clean "$_vivaldi_profile"/Service\ Worker/ScriptCache/* "Vivaldi Service Worker ScriptCache"
-            fi
         done
     fi
     safe_clean ~/Library/Caches/Comet/* "Comet cache"

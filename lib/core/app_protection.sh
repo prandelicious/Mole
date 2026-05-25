@@ -121,6 +121,42 @@ should_protect_from_uninstall() {
     return 1
 }
 
+# Print the vendor name when an app must be removed through its official
+# uninstaller instead of Mole's generic Trash/delete path.
+official_uninstaller_vendor() {
+    local bundle_id="${1:-}"
+    local display_name="${2:-}"
+    local app_path="${3:-}"
+    local normalized_bundle normalized_name normalized_path
+    normalized_bundle=$(printf '%s' "$bundle_id" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+    normalized_name=$(printf '%s' "$display_name" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+    normalized_path=$(basename "${app_path:-}" .app | LC_ALL=C tr '[:upper:]' '[:lower:]')
+
+    local rule vendor prefixes fragments prefix fragment
+    local -a _prefixes _fragments
+    for rule in "${OFFICIAL_UNINSTALLER_RULES[@]}"; do
+        IFS='|' read -r vendor prefixes fragments <<< "$rule"
+        IFS=',' read -r -a _prefixes <<< "$prefixes"
+        for prefix in "${_prefixes[@]}"; do
+            [[ -n "$prefix" && "$normalized_bundle" == "$prefix"* ]] && {
+                printf '%s\n' "$vendor"
+                return 0
+            }
+        done
+
+        IFS=',' read -r -a _fragments <<< "$fragments"
+        for fragment in "${_fragments[@]}"; do
+            if [[ -n "$fragment" ]] &&
+                { [[ "$normalized_name" == *"$fragment"* ]] || [[ "$normalized_path" == *"$fragment"* ]]; }; then
+                printf '%s\n' "$vendor"
+                return 0
+            fi
+        done
+    done
+
+    return 1
+}
+
 # Check if application data should be protected during cleanup
 should_protect_data() {
     local bundle_id="$1"
@@ -1212,31 +1248,7 @@ find_app_receipt_files() {
                 # Normalize path (remove duplicate slashes)
                 clean_path=$(tr -s "/" <<< "$clean_path")
 
-                # ------------------------------------------------------------------------
-                # Safety check: restrict removal to trusted paths
-                # ------------------------------------------------------------------------
-                local is_safe=false
-
-                # Whitelisted prefixes (exclude /Users, /usr, /opt)
-                case "$clean_path" in
-                    /Applications/*) is_safe=true ;;
-                    /Library/Application\ Support/*) is_safe=true ;;
-                    /Library/Caches/*) is_safe=true ;;
-                    /Library/Logs/*) is_safe=true ;;
-                    /Library/Preferences/*) is_safe=true ;;
-                    /Library/LaunchAgents/*) is_safe=true ;;
-                    /Library/LaunchDaemons/*) is_safe=true ;;
-                    /Library/PrivilegedHelperTools/*) is_safe=true ;;
-                    /Library/Extensions/*) is_safe=false ;;
-                    *) is_safe=false ;;
-                esac
-
-                # Hard blocks
-                case "$clean_path" in
-                    /System/* | /usr/bin/* | /usr/lib/* | /bin/* | /sbin/* | /private/*) is_safe=false ;;
-                esac
-
-                if [[ "$is_safe" == "true" && -e "$clean_path" ]]; then
+                if receipt_payload_path_is_allowlisted "$clean_path" "$bundle_id" && [[ -e "$clean_path" ]]; then
                     # Skip top-level directories
                     if [[ "$clean_path" == "/Applications" || "$clean_path" == "/Library" ]]; then
                         continue
@@ -1259,12 +1271,41 @@ find_app_receipt_files() {
     fi
 }
 
-# Politely ask a running application to quit (Mole Mac app parity).
-# NOTE: despite the legacy name, this no longer force-kills. It sends the
-# graceful Quit Apple Event and reports (return 1) when the app stays open;
-# the caller surfaces a warning instead of escalating to a kill signal.
+receipt_payload_path_is_allowlisted() {
+    local clean_path="$1"
+    local bundle_id="$2"
+    local base
+    base=$(basename "$clean_path")
+
+    [[ -n "$clean_path" && -n "$bundle_id" ]] || return 1
+    mole_is_reverse_dns_bundle_id "$bundle_id" || return 1
+
+    case "$clean_path" in
+        /Library/LaunchAgents/*.plist | /Library/LaunchDaemons/*.plist)
+            [[ "$base" == "$bundle_id.plist" || "$base" == "$bundle_id."*.plist ]]
+            return
+            ;;
+        /Library/PrivilegedHelperTools/*)
+            mole_name_starts_with_bundle_id_boundary "$base" "$bundle_id"
+            return
+            ;;
+        /private/var/db/receipts/*)
+            [[ "$base" == "$bundle_id.bom" || "$base" == "$bundle_id.plist" || "$base" == "$bundle_id."* ]]
+            return
+            ;;
+    esac
+
+    return 1
+}
+
+# Terminate a running application during uninstall.
+# The user has already confirmed removal, so after the graceful Quit Apple
+# Event we escalate through SIGTERM and SIGKILL (and one sudo retry when
+# non-interactive sudo is already cached) to avoid leaving a zombie process
+# after "Uninstall complete". Apps that need to flush state get the graceful
+# Quit window first; apps that stall past it lose unsaved work, which the
+# user has implicitly accepted by confirming.
 force_kill_app() {
-    # Sends only a graceful Quit; never SIGTERM/SIGKILL or sudo.
     local app_name="$1"
     local app_path="${2:-""}"
 
@@ -1320,15 +1361,45 @@ force_kill_app() {
         wait "$quit_pid" 2> /dev/null || true
     fi
 
-    # Mole Mac app parity: after the graceful Quit Apple Event, Mole does not
-    # escalate to SIGTERM, SIGKILL, or sudo. Force-killing risks losing the
-    # app's unsaved work and can leave half-written state on disk. A still-
-    # running app is reported so the caller warns the user; macOS allows
-    # removing a running app bundle, so the uninstall itself still proceeds.
-    if pgrep -x "$match_pattern" > /dev/null 2>&1; then
-        return 1
+    # Graceful Quit landed: skip the kill ladder entirely.
+    if ! pgrep -x "$match_pattern" > /dev/null 2>&1; then
+        return 0
     fi
-    return 0
+
+    # Escalate: SIGTERM, then SIGKILL, then one sudo SIGKILL retry when a
+    # cached sudo session is already available (no new prompt). The user
+    # confirmed uninstall, so a still-running process at this point is
+    # blocking a clean result and we trade unsaved state for that.
+    pkill -x "$match_pattern" 2> /dev/null || true
+    sleep 2
+    if ! pgrep -x "$match_pattern" > /dev/null 2>&1; then
+        return 0
+    fi
+
+    pkill -9 -x "$match_pattern" 2> /dev/null || true
+    sleep 2
+    if ! pgrep -x "$match_pattern" > /dev/null 2>&1; then
+        return 0
+    fi
+
+    if [[ "${MOLE_TEST_MODE:-0}" != "1" && "${MOLE_TEST_NO_AUTH:-0}" != "1" ]] &&
+        sudo -n true 2> /dev/null; then
+        sudo pkill -9 -x "$match_pattern" 2> /dev/null || true
+        sleep 2
+    fi
+
+    # Final retries for stubborn processes (e.g. apps mid-fsync that need a
+    # moment to fully exit after SIGKILL).
+    local retries=3
+    while [[ $retries -gt 0 ]]; do
+        if ! pgrep -x "$match_pattern" > /dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        ((retries--))
+    done
+
+    pgrep -x "$match_pattern" > /dev/null 2>&1 && return 1 || return 0
 }
 
 # Note: calculate_total_size() is defined in lib/core/file_ops.sh

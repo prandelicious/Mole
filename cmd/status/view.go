@@ -146,6 +146,10 @@ func renderHeader(m MetricsSnapshot, errMsg string, animFrame int, termWidth int
 
 	scoreStyle := getScoreStyle(m.HealthScore)
 	scoreText := subtleStyle.Render("Health ") + scoreStyle.Render(fmt.Sprintf("● %d", m.HealthScore))
+	if errMsg == "" {
+		diagnosis := statusDiagnosisLine(m)
+		scoreText += " " + subtleStyle.Render(diagnosis)
+	}
 
 	// Hardware info for a single line.
 	infoParts := []string{}
@@ -484,12 +488,22 @@ func renderProcessCard(procs []ProcessInfo) cardData {
 		}
 		name := shorten(p.Name, 12)
 		cpuBar := miniBar(p.CPU)
-		lines = append(lines, fmt.Sprintf("%-12s  %s  %5.1f%%", name, cpuBar, p.CPU))
+		lines = append(lines, fmt.Sprintf("%-12s  %s  %5.1f%%%s", name, cpuBar, p.CPU, processHint(p)))
 	}
 	if len(lines) == 0 {
 		lines = append(lines, subtleStyle.Render("No data"))
 	}
 	return cardData{icon: iconProcs, title: "Processes", lines: lines}
+}
+
+func processHint(p ProcessInfo) string {
+	if p.Memory >= 10 {
+		return fmt.Sprintf(" M%.0f%%", p.Memory)
+	}
+	if p.CPU >= cpuHighThreshold {
+		return " hot"
+	}
+	return ""
 }
 
 func buildCards(m MetricsSnapshot, width int) []cardData {

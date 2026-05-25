@@ -980,3 +980,198 @@ EOF
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"ok"* ]]
 }
+
+@test "opt_diag_parse_image_mount_pairs ignores image-alias/icon-path lines (#960)" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/diagnostics.sh"
+
+# Sample hdiutil info block reproducing the issue from #960. The image-alias
+# line carries an absolute path identical to image-path, which the previous
+# extract_mount regex incorrectly accepted as a mount point. Only the
+# /dev/disk* line is a real mount.
+sample=$(cat <<'HDIUTIL'
+================================================
+image-path                 : /Volumes/EXT3/Mail/TB.dmg
+image-alias                : /Volumes/EXT3/Mail/TB.dmg
+shadow-path                : <none>
+icon-path                  : /System/Library/PrivateFrameworks/DiskImages.framework/Resources/CDiskImage.icns
+image-type                 : read-only
+/dev/disk6                 Apple_partition_scheme
+/dev/disk6s1               Apple_partition_map
+/dev/disk6s2               Apple_HFS                       /Volumes/mail
+HDIUTIL
+)
+
+opt_diag_parse_image_mount_pairs "$sample"
+EOF
+
+	[ "$status" -eq 0 ]
+	# Expect exactly one pair: image=/Volumes/EXT3/Mail/TB.dmg mount=/Volumes/mail
+	line_count=$(printf '%s\n' "$output" | awk 'NF' | wc -l | tr -d ' ')
+	[ "$line_count" = "1" ]
+	[[ "$output" == *"/Volumes/EXT3/Mail/TB.dmg"$'\t'"/Volumes/mail"* ]]
+	# Critical regression guard: image-alias line must not surface as a mount.
+	[[ "$output" != *"/Volumes/EXT3/Mail/TB.dmg"$'\t'"/Volumes/EXT3/Mail/TB.dmg"* ]]
+}
+
+@test "has_active_vpn_interface respects MOLE_ASSUME_VPN_ACTIVE override" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=1 bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+# Force scutil/route to fail loudly so the env override is the only path.
+scutil() { echo "should not be called" >&2; return 1; }
+route() { echo "should not be called" >&2; return 1; }
+export -f scutil route
+if has_active_vpn_interface; then echo "vpn"; else echo "no_vpn"; fi
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"vpn"* ]]
+	[[ "$output" != *"no_vpn"* ]]
+	[[ "$output" != *"should not be called"* ]]
+}
+
+@test "has_active_vpn_interface returns false when MOLE_ASSUME_VPN_ACTIVE=0" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=0 bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+# scutil/route should not run when env says no.
+scutil() { echo "should not be called" >&2; return 1; }
+route() { echo "should not be called" >&2; return 1; }
+export -f scutil route
+if has_active_vpn_interface; then echo "vpn"; else echo "no_vpn"; fi
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"no_vpn"* ]]
+	[[ "$output" != *"should not be called"* ]]
+}
+
+@test "has_active_vpn_interface detects scutil Connected entry" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+scutil() {
+    cat <<'NC'
+* (Disconnected)   AA1B2C3D-1111-2222-3333-444455556666   PPP     (L2TP)         "Office VPN"   [L2TP]
+* (Connected)      87654321-aaaa-bbbb-cccc-dddddddddddd   IPSec   (IKEv2)        "Remote Office"[IKEv2]
+NC
+}
+export -f scutil
+# Default route should NOT be consulted once scutil already proved a VPN active.
+route() { echo "should not be called" >&2; return 1; }
+export -f route
+if has_active_vpn_interface; then echo "vpn"; else echo "no_vpn"; fi
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"vpn"* ]]
+	[[ "$output" != *"should not be called"* ]]
+}
+
+@test "has_active_vpn_interface ignores scutil entries that are all Disconnected" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+scutil() {
+    cat <<'NC'
+* (Disconnected)   AA1B2C3D-1111-2222-3333-444455556666   PPP     (L2TP)         "Office VPN"   [L2TP]
+* (Disconnected)   87654321-aaaa-bbbb-cccc-dddddddddddd   IPSec   (IKEv2)        "Remote Office"[IKEv2]
+NC
+}
+# Default route via en0 (no VPN). This is the user's case in #959.
+route() {
+    cat <<'ROUTE'
+   route to: default
+destination: default
+       mask: default
+    gateway: 192.168.1.1
+  interface: en0
+ROUTE
+}
+export -f scutil route
+if has_active_vpn_interface; then echo "vpn"; else echo "no_vpn"; fi
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"no_vpn"* ]]
+}
+
+@test "has_active_vpn_interface detects full-tunnel via utun default route" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+# No system-managed VPN configured in scutil.
+scutil() { echo ""; }
+# Default route owned by utun3 -> full-tunnel VPN (WireGuard / OpenVPN style).
+route() {
+    cat <<'ROUTE'
+   route to: default
+destination: default
+       mask: default
+    gateway: 10.8.0.1
+  interface: utun3
+ROUTE
+}
+export -f scutil route
+if has_active_vpn_interface; then echo "vpn"; else echo "no_vpn"; fi
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"vpn"* ]]
+}
+
+@test "has_active_vpn_interface returns false for iCloud Private Relay style utun (#959)" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+# Private Relay / Continuity create utun* but the default route stays on en0.
+# The old netstat/ifconfig probe would have false-positived this; the new
+# probe must not.
+scutil() { echo ""; }
+route() {
+    cat <<'ROUTE'
+   route to: default
+destination: default
+       mask: default
+    gateway: 192.168.1.1
+  interface: en0
+ROUTE
+}
+export -f scutil route
+if has_active_vpn_interface; then echo "vpn"; else echo "no_vpn"; fi
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"no_vpn"* ]]
+}
+
+@test "opt_diag_parse_image_mount_pairs handles multiple blocks" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/diagnostics.sh"
+
+sample=$(cat <<'HDIUTIL'
+================================================
+image-path                 : /Users/test/Sample.dmg
+image-alias                : /Users/test/Sample.dmg
+/dev/disk5s2               Apple_HFS                       /Volumes/Sample
+================================================
+image-path                 : /Library/Developer/CoreSimulator/Volumes/iOS_17.dmg
+image-alias                : /Library/Developer/CoreSimulator/Volumes/iOS_17.dmg
+/dev/disk7s1               Apple_APFS                      /Library/Developer/CoreSimulator/Volumes/iOS_17.0
+HDIUTIL
+)
+
+opt_diag_parse_image_mount_pairs "$sample" | awk 'NF' | sort
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"/Users/test/Sample.dmg"$'\t'"/Volumes/Sample"* ]]
+	[[ "$output" == *"/Library/Developer/CoreSimulator/Volumes/iOS_17.dmg"$'\t'"/Library/Developer/CoreSimulator/Volumes/iOS_17.0"* ]]
+	line_count=$(printf '%s\n' "$output" | awk 'NF' | wc -l | tr -d ' ')
+	[ "$line_count" = "2" ]
+}
