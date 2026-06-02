@@ -135,6 +135,22 @@ teardown() {
     [ "$status" -eq 0 ]
 }
 
+@test "should_protect_path protects OrbStack live container data" {
+    local orb_group_data="$HOME/Library/Group Containers/HUAQ24HBR6.dev.orbstack/data/data.img.raw"
+    local orb_state="$HOME/.orbstack/state.db"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ORB_GROUP_DATA="$orb_group_data" ORB_STATE="$orb_state" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+should_protect_data "dev.orbstack.OrbStack"
+should_protect_data "dev.kdrag0n.MacVirt"
+should_protect_path "$ORB_GROUP_DATA"
+should_protect_path "$ORB_STATE"
+EOF
+
+    [ "$status" -eq 0 ]
+}
+
 @test "safe_remove validates path before deletion" {
     run bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; safe_remove '/System/test' 2>&1"
     [ "$status" -eq 1 ]
@@ -147,6 +163,16 @@ teardown() {
     run bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '$link_path' 2>&1"
     [ "$status" -eq 1 ]
     [[ "$output" == *"protected system path"* ]]
+}
+
+@test "safe_remove silent mode hides protected symlink validation warning" {
+    local link_path="$TEST_DIR/silent-system-link"
+    ln -s "/System" "$link_path"
+
+    run bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; safe_remove '$link_path' true 2>&1"
+    [ "$status" -eq 1 ]
+    [[ -L "$link_path" ]]
+    [[ "$output" != *"Symlink points to protected system path"* ]]
 }
 
 @test "safe_remove successfully removes file" {

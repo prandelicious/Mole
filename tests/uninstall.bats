@@ -556,6 +556,71 @@ EOF
 		|| { echo "WRONG: unsafe id did not fall back to app name"; cat "$trace"; return 1; }
 }
 
+@test "force_kill_app refuses to operate on system process names" {
+	# Defensive guard: a third-party .app could set CFBundleExecutable to a
+	# system process name (Finder, Dock, loginwindow, etc.). Even though the
+	# uninstall selection layer filters out protected bundle IDs, force_kill_app
+	# is a public function and must hold its own boundary. Verify it returns 1
+	# without invoking pkill or osascript for these names.
+	stubdir="$HOME/stubs"
+	mkdir -p "$stubdir"
+	trace="$HOME/system_proc_trace.log"
+	: > "$trace"
+
+	cat > "$stubdir/osascript" <<STUB
+#!/bin/bash
+printf 'osascript %s\n' "\$*" >> "$trace"
+exit 0
+STUB
+	chmod +x "$stubdir/osascript"
+
+	for spoofed in Finder Dock loginwindow WindowServer SystemUIServer; do
+		: > "$trace"
+		run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" PATH="$stubdir:$PATH" \
+			TRACE_PATH="$trace" SPOOFED="$spoofed" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+
+app_path="$HOME/Applications/Evil-$SPOOFED.app"
+mkdir -p "$app_path/Contents"
+cat > "$app_path/Contents/Info.plist" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>$SPOOFED</string>
+  <key>CFBundleIdentifier</key><string>com.example.evil</string>
+</dict></plist>
+PLIST
+
+pkill() {
+	printf 'pkill %s\n' "$*" >> "$TRACE_PATH"
+	return 0
+}
+export -f pkill
+
+# pgrep must NOT be called - the guard runs before any process probing.
+pgrep() {
+	printf 'pgrep %s\n' "$*" >> "$TRACE_PATH"
+	return 0
+}
+export -f pgrep
+
+sleep() { :; }
+export -f sleep
+
+unset MOLE_TEST_MODE MOLE_TEST_NO_AUTH
+
+force_kill_app "Evil-$SPOOFED" "$app_path"
+EOF
+
+		[ "$status" -eq 1 ] \
+			|| { echo "WRONG: spoofed $spoofed did not return 1 (got $status)"; cat "$trace"; return 1; }
+		if [[ -s "$trace" ]]; then
+			echo "WRONG: spoofed $spoofed reached pkill/pgrep/osascript"; cat "$trace"; return 1
+		fi
+	done
+}
+
 @test "batch_uninstall_applications proceeds with deletion when force_kill_app fails" {
 	# Reproduces the issue where uninstalling a still-running app (e.g. Mole.app
 	# with a watchdog or XPC helper that ignores SIGKILL) used to abort with
@@ -1448,6 +1513,134 @@ actual=$(cat "$trace_file")
 INNER
 
 	[ "$status" -eq 0 ]
+}
+
+@test "scan_applications starts feedback before discovery and cleans no-app state" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_FORCE_SCAN_SPINNER=1 bash --noprofile --norc <<'INNER'
+set -euo pipefail
+
+trace_file="$HOME/scan-feedback-trace.log"
+scan_temp="$HOME/scan-feedback-temp"
+
+MOLE_UNINSTALL_META_CACHE_DIR="$HOME/.cache/mole"
+MOLE_UNINSTALL_META_CACHE_FILE="$MOLE_UNINSTALL_META_CACHE_DIR/uninstall_app_metadata_v1"
+MOLE_UNINSTALL_META_CACHE_LOCK="${MOLE_UNINSTALL_META_CACHE_FILE}.lock"
+
+create_temp_file() { printf '%s\n' "$scan_temp"; }
+ensure_user_dir() { mkdir -p "$1"; }
+ensure_user_file() {
+    mkdir -p "$(dirname "$1")"
+    : > "$1"
+}
+
+_scan_discover_apps() {
+    if [[ -n "${spinner_pid:-}" ]]; then
+        printf 'spinner-before-discover\n' >> "$trace_file"
+    else
+        printf 'missing-spinner\n' >> "$trace_file"
+    fi
+    : > "$discovered_file"
+}
+_scan_partition_cache() { printf 'partition\n' >> "$trace_file"; }
+_scan_resolve_uncached() { printf 'resolve\n' >> "$trace_file"; }
+_scan_dedupe_bundle_ids() { printf 'dedupe\n' >> "$trace_file"; }
+_scan_finalize_index() { printf 'finalize\n' >> "$trace_file"; }
+
+eval "$(sed -n '/^scan_applications()/,/^load_applications()/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
+
+set +e
+scan_applications > "$HOME/scan-feedback.out" 2> "$HOME/scan-feedback.err"
+rc=$?
+set -e
+
+[[ $rc -eq 1 ]] || exit 1
+
+expected=$(printf 'spinner-before-discover\npartition\n')
+actual=$(cat "$trace_file")
+[[ "$actual" == "$expected" ]] || {
+    printf 'unexpected trace:\n%s\n' "$actual" >&2
+    exit 1
+}
+
+[[ ! -e "${scan_temp}.spinner_shown" ]]
+[[ ! -e "${scan_temp}.scan_status" ]]
+INNER
+
+	[ "$status" -eq 0 ]
+}
+
+@test "select_apps_for_uninstall drains pending input before opening paginated menu" {
+	mkdir -p "$HOME/Applications/TraceApp.app"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TERM="xterm-256color" bash --noprofile --norc <<'INNER'
+set -euo pipefail
+
+trace_file="$HOME/selector-drain-trace.log"
+
+source "$PROJECT_ROOT/lib/ui/app_selector.sh"
+
+apps_data=("1700000000|$HOME/Applications/TraceApp.app|TraceApp|com.example.TraceApp|1MB|Today|1024")
+selected_apps=()
+
+get_display_width() { printf '%s\n' "${#1}"; }
+format_app_display() {
+    printf 'format\n' >> "$trace_file"
+    printf '%s' "$1"
+}
+drain_pending_input() { printf 'drain\n' >> "$trace_file"; }
+paginated_multi_select() {
+    printf 'guard:%s\n' "${MOLE_MENU_IGNORE_INITIAL_ENTER:-unset}" >> "$trace_file"
+    printf 'paginated\n' >> "$trace_file"
+    MOLE_SELECTION_RESULT="0"
+    return 0
+}
+
+select_apps_for_uninstall
+[[ ${#selected_apps[@]} -eq 1 ]]
+[[ -z "${MOLE_MENU_IGNORE_INITIAL_ENTER:-}" ]]
+
+expected=$(printf 'format\ndrain\nguard:1\npaginated\n')
+actual=$(cat "$trace_file")
+[[ "$actual" == "$expected" ]] || {
+    printf 'unexpected trace:\n%s\n' "$actual" >&2
+    exit 1
+}
+INNER
+
+	[ "$status" -eq 0 ]
+}
+
+@test "paginated menu can ignore one initial Enter for uninstall launch guard" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TERM="xterm-256color" bash --noprofile --norc <<'INNER'
+set -euo pipefail
+
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/ui/menu_paginated.sh"
+
+key_state="$HOME/menu-initial-enter-state"
+read_key() {
+    if [[ ! -f "$key_state" ]]; then
+        : > "$key_state"
+        echo "ENTER"
+    else
+        echo "QUIT"
+    fi
+}
+
+MOLE_SELECTION_RESULT=""
+set +e
+MOLE_MENU_IGNORE_INITIAL_ENTER=1 paginated_multi_select "Test Menu" "First App" > "$HOME/menu.out" 2> "$HOME/menu.err"
+rc=$?
+set -e
+
+echo "rc=$rc"
+echo "result=${MOLE_SELECTION_RESULT:-}"
+INNER
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"rc=1"* ]]
+	[[ "$output" == *"result="* ]]
+	[[ "$output" != *"result=0"* ]]
 }
 
 @test "main rescans cleanly after returning from a completed uninstall (#866)" {

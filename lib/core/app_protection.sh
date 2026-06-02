@@ -87,20 +87,11 @@ build_regex_var() {
 # Lazy-loaded regex (only built when needed)
 APPLE_UNINSTALLABLE_REGEX=""
 SYSTEM_CRITICAL_REGEX=""
-SYSTEM_CRITICAL_FAST_REGEX=""
-DATA_PROTECTED_REGEX=""
 
 _ensure_uninstall_regex() {
     if [[ -z "$SYSTEM_CRITICAL_REGEX" ]]; then
         build_regex_var APPLE_UNINSTALLABLE_REGEX "${APPLE_UNINSTALLABLE_APPS[@]}"
         build_regex_var SYSTEM_CRITICAL_REGEX "${SYSTEM_CRITICAL_BUNDLES[@]}"
-    fi
-}
-
-_ensure_data_protection_regex() {
-    if [[ -z "$SYSTEM_CRITICAL_FAST_REGEX" ]]; then
-        build_regex_var SYSTEM_CRITICAL_FAST_REGEX "${SYSTEM_CRITICAL_BUNDLES_FAST[@]}"
-        build_regex_var DATA_PROTECTED_REGEX "${DATA_PROTECTED_BUNDLES[@]}"
     fi
 }
 
@@ -274,6 +265,10 @@ should_protect_path() {
         */Library/Group\ Containers/com.apple.systempreferences* | */Library/Group\ Containers/com.apple.Settings*)
             return 0
             ;;
+        # OrbStack group containers hold live container filesystem images.
+        */Library/Group\ Containers/*dev.orbstack | */Library/Group\ Containers/*dev.orbstack/* | */.orbstack | */.orbstack/*)
+            return 0
+            ;;
         # Shared file lists for System Settings (macOS Sequoia) - Issue #136
         */com.apple.sharedfilelist/*com.apple.Settings* | */com.apple.sharedfilelist/*com.apple.SystemSettings* | */com.apple.sharedfilelist/*systempreferences*)
             return 0
@@ -309,6 +304,17 @@ should_protect_path() {
             ;;
         # Protect Mole's own runtime logs so cleanup cannot delete its active log targets.
         */Library/Logs/mole | */Library/Logs/mole/ | */Library/Logs/mole/*)
+            return 0
+            ;;
+        # Codex Desktop and CLI keep conversation indexes and app state in cache-
+        # shaped paths. Default cleanup must not remove those records.
+        */Library/Application\ Support/Codex | */Library/Application\ Support/Codex/* | \
+            */Library/Logs/com.openai.codex | */Library/Logs/com.openai.codex/* | \
+            */.codex/sessions | */.codex/sessions/* | \
+            */.codex/auth.json | */.codex/history.jsonl | \
+            */.codex/state_*.sqlite | */.codex/logs_*.sqlite | \
+            */.codex/session_index.jsonl | */.codex/cache/session_index.jsonl | \
+            */.codex/cache/codex_app_directory | */.codex/cache/codex_app_directory/*)
             return 0
             ;;
         # Bluetooth and WiFi configurations
@@ -605,6 +611,45 @@ find_shared_app_paths() {
     done | sort -u
 }
 
+# Return 0 when `path` looks like a dotdir / XDG state directory belonging to
+# a standalone CLI tool shipped independently of any same-named GUI app.
+# find_app_files uses this to skip candidates that would otherwise nuke
+# unrelated CLI state when uninstalling a same-named GUI app (#993).
+#
+# Lowercase comparison so case-insensitive APFS (~/.Claude vs ~/.claude) is
+# handled. Scope is restricted to four well-known parents so we never skip
+# legitimate non-dotdir locations.
+#
+# The deny-list is inlined rather than read from an array because bats 1.x
+# does not carry readonly arrays from setup() into the @test body, and a
+# regression in any of these names is destructive enough that we never want
+# the safeguard to silently no-op in a fresh subshell.
+_path_belongs_to_independent_cli() {
+    local path="$1"
+    [[ -z "$path" ]] && return 1
+
+    local base parent lc_name
+    base="${path##*/}"
+    parent="${path%/*}"
+    lc_name=$(printf '%s' "${base#.}" | tr '[:upper:]' '[:lower:]')
+    [[ -z "$lc_name" ]] && return 1
+
+    case "$lc_name" in
+        # Keep this list in sync with INDEPENDENT_CLI_DOTDIR_NAMES in
+        # app_protection_data.sh (kept there for discoverability /
+        # documentation; this case is the live source of truth).
+        claude | opencode | codex | gemini) ;;
+        *) return 1 ;;
+    esac
+
+    case "$parent" in
+        "$HOME" | "$HOME/.config" | "$HOME/.local/share" | "$HOME/.cache")
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 # Locate files associated with an application
 find_app_files() {
     local bundle_id="$1"
@@ -758,6 +803,13 @@ find_app_files() {
                 continue
                 ;;
         esac
+
+        # Skip XDG dotdirs that belong to independent CLI tools sharing a name
+        # with the GUI app being uninstalled (issue #993).
+        if _path_belongs_to_independent_cli "$expanded_path"; then
+            debug_log "Skipping independent CLI dotdir: $expanded_path"
+            continue
+        fi
 
         files_to_clean+=("$expanded_path")
     done
@@ -1326,6 +1378,20 @@ force_kill_app() {
 
     # Use executable name for precise matching, fallback to app name
     local match_pattern="${exec_name:-$app_name}"
+
+    # Defensive guard: even though should_protect_from_uninstall (bin/uninstall.sh)
+    # filters protected bundle IDs out of the selection list, match_pattern comes
+    # from CFBundleExecutable (a string a third-party .app can set freely). Refuse
+    # to AppleScript-Quit or pkill any pattern that exactly matches a critical
+    # system process name. force_kill_app is a public function; future callers
+    # must not be able to weaponise a spoofed executable name to take down Finder,
+    # Dock, loginwindow, etc.
+    case "$match_pattern" in
+        Finder | Dock | loginwindow | WindowServer | SystemUIServer | launchd | coreaudiod | NotificationCenter | ControlCenter | Spotlight)
+            debug_log "force_kill_app: refusing to operate on system process name '$match_pattern'"
+            return 1
+            ;;
+    esac
 
     # Check if process is running using exact match only
     if ! pgrep -x "$match_pattern" > /dev/null 2>&1; then

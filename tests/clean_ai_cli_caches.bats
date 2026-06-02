@@ -27,7 +27,7 @@ setup() {
         echo "FATAL: HOME is not a test temp dir: $HOME"
         exit 1
     }
-    rm -rf "$HOME/.codex" "$HOME/.gemini"
+    rm -rf "$HOME/.codex" "$HOME/.gemini" "$HOME/.claude" "$HOME/Library/Application Support/Claude"
 }
 
 assert_run_success() {
@@ -56,11 +56,13 @@ assert_output_not_contains() {
     }
 }
 
-@test "clean_codex_cli cleans codex cache, tmp, and log directories" {
+@test "clean_codex_cli skips codex state by default" {
     mkdir -p "$HOME/.codex/cache" "$HOME/.codex/.tmp" "$HOME/.codex/log" "$HOME/.codex/sessions"
-    touch "$HOME/.codex/cache/c.bin" "$HOME/.codex/.tmp/t.bin" "$HOME/.codex/log/codex-tui.log"
+    mkdir -p "$HOME/.codex/cache/codex_app_directory"
+    touch "$HOME/.codex/cache/c.bin" "$HOME/.codex/cache/session_index.jsonl"
+    touch "$HOME/.codex/cache/codex_app_directory/index.json" "$HOME/.codex/.tmp/t.bin" "$HOME/.codex/log/codex-tui.log"
     touch "$HOME/.codex/sessions/s.jsonl" "$HOME/.codex/auth.json" "$HOME/.codex/history.jsonl"
-    touch "$HOME/.codex/state_5.sqlite" "$HOME/.codex/logs_2.sqlite"
+    touch "$HOME/.codex/state_5.sqlite" "$HOME/.codex/logs_2.sqlite" "$HOME/.codex/session_index.jsonl"
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -73,14 +75,15 @@ clean_codex_cli
 EOF
 
     assert_run_success
-    assert_output_contains "SAFE_CLEAN:Codex CLI cache|$HOME/.codex/cache/"
-    assert_output_contains "SAFE_CLEAN:Codex CLI temp files|$HOME/.codex/.tmp/"
-    assert_output_contains "SAFE_CLEAN:Codex CLI logs|$HOME/.codex/log/"
-    assert_output_not_contains "sessions"
-    assert_output_not_contains "auth.json"
-    assert_output_not_contains "history.jsonl"
-    assert_output_not_contains "state_5.sqlite"
-    assert_output_not_contains "logs_2.sqlite"
+    assert_output_contains "Codex CLI state · skipped by default"
+    assert_output_not_contains "SAFE_CLEAN:"
+    [ -f "$HOME/.codex/cache/session_index.jsonl" ]
+    [ -f "$HOME/.codex/cache/codex_app_directory/index.json" ]
+    [ -f "$HOME/.codex/.tmp/t.bin" ]
+    [ -f "$HOME/.codex/log/codex-tui.log" ]
+    [ -f "$HOME/.codex/sessions/s.jsonl" ]
+    [ -f "$HOME/.codex/state_5.sqlite" ]
+    [ -f "$HOME/.codex/logs_2.sqlite" ]
 }
 
 @test "clean_codex_cli is a no-op when ~/.codex is absent" {
@@ -98,7 +101,7 @@ EOF
     assert_output_not_contains "SAFE_CLEAN:"
 }
 
-@test "clean_codex_cli skips all targets while Codex is running" {
+@test "clean_codex_cli reports running Codex without cleaning state" {
     mkdir -p "$HOME/.codex/cache" "$HOME/.codex/.tmp" "$HOME/.codex/log"
     touch "$HOME/.codex/cache/c.bin"
 
@@ -113,7 +116,7 @@ clean_codex_cli
 EOF
 
     assert_run_success
-    assert_output_contains "Codex CLI caches · skipped (Codex running)"
+    assert_output_contains "Codex CLI state · skipped (Codex running)"
     assert_output_not_contains "SAFE_CLEAN:"
 }
 
@@ -231,4 +234,184 @@ EOF
     assert_run_success
     assert_output_contains "CODEX_CLI_CALLED"
     assert_output_contains "ANTIGRAVITY_CALLED"
+}
+
+@test "clean_dev_ai_agents reaps stale Claude Desktop bundled versions when active version is known" {
+    local claude_support="$HOME/Library/Application Support/Claude"
+    mkdir -p "$claude_support/claude-code/2.1.140" "$claude_support/claude-code/2.1.142" "$claude_support/claude-code/2.1.150"
+    mkdir -p "$claude_support/claude-code-vm/2.1.140" "$claude_support/claude-code-vm/2.1.142" "$claude_support/claude-code-vm/2.1.150"
+    echo "2.1.150" > "$claude_support/claude-code-vm/.sdk-version"
+    touch -t 202604010000 "$claude_support/claude-code/2.1.140" "$claude_support/claude-code-vm/2.1.140"
+    touch -t 202604150000 "$claude_support/claude-code/2.1.142" "$claude_support/claude-code-vm/2.1.142"
+    touch -t 202604250000 "$claude_support/claude-code/2.1.150" "$claude_support/claude-code-vm/2.1.150"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
+pgrep() { return 1; }
+clean_dev_ai_agents
+EOF
+
+    assert_run_success
+    assert_output_contains "SAFE_CLEAN:Claude Desktop bundled Claude Code old version|$claude_support/claude-code/2.1.140"
+    assert_output_contains "SAFE_CLEAN:Claude Desktop bundled Claude Code VM old version|$claude_support/claude-code-vm/2.1.140"
+    assert_output_not_contains "$claude_support/claude-code/2.1.142"
+    assert_output_not_contains "$claude_support/claude-code-vm/2.1.142"
+    assert_output_not_contains "$claude_support/claude-code/2.1.150"
+    assert_output_not_contains "$claude_support/claude-code-vm/2.1.150"
+}
+
+@test "clean_dev_ai_agents keeps active Claude Desktop bundled version even when it is older" {
+    local claude_support="$HOME/Library/Application Support/Claude"
+    mkdir -p "$claude_support/claude-code/2.1.140" "$claude_support/claude-code/2.1.142" "$claude_support/claude-code/2.1.150"
+    mkdir -p "$claude_support/claude-code-vm/2.1.140" "$claude_support/claude-code-vm/2.1.142" "$claude_support/claude-code-vm/2.1.150"
+    echo "2.1.140" > "$claude_support/claude-code-vm/.sdk-version"
+    touch -t 202604010000 "$claude_support/claude-code/2.1.140" "$claude_support/claude-code-vm/2.1.140"
+    touch -t 202604150000 "$claude_support/claude-code/2.1.142" "$claude_support/claude-code-vm/2.1.142"
+    touch -t 202604250000 "$claude_support/claude-code/2.1.150" "$claude_support/claude-code-vm/2.1.150"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
+pgrep() { return 1; }
+clean_dev_ai_agents
+EOF
+
+    assert_run_success
+    assert_output_contains "SAFE_CLEAN:Claude Desktop bundled Claude Code old version|$claude_support/claude-code/2.1.142"
+    assert_output_contains "SAFE_CLEAN:Claude Desktop bundled Claude Code VM old version|$claude_support/claude-code-vm/2.1.142"
+    assert_output_not_contains "$claude_support/claude-code/2.1.140"
+    assert_output_not_contains "$claude_support/claude-code-vm/2.1.140"
+    assert_output_not_contains "$claude_support/claude-code/2.1.150"
+    assert_output_not_contains "$claude_support/claude-code-vm/2.1.150"
+}
+
+@test "clean_dev_ai_agents leaves single Claude Desktop bundled version alone" {
+    local claude_support="$HOME/Library/Application Support/Claude"
+    mkdir -p "$claude_support/claude-code/2.1.150" "$claude_support/claude-code-vm/2.1.150"
+    echo "2.1.150" > "$claude_support/claude-code-vm/.sdk-version"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
+pgrep() { return 1; }
+clean_dev_ai_agents
+EOF
+
+    assert_run_success
+    assert_output_not_contains "Claude Desktop bundled Claude Code"
+    assert_output_not_contains "SAFE_CLEAN:"
+}
+
+@test "clean_dev_ai_agents skips Claude Desktop bundled versions when active version is unknown" {
+    local claude_support="$HOME/Library/Application Support/Claude"
+    mkdir -p "$claude_support/claude-code/2.1.140" "$claude_support/claude-code/2.1.150"
+    mkdir -p "$claude_support/claude-code-vm/2.1.140" "$claude_support/claude-code-vm/2.1.150"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
+pgrep() { return 1; }
+clean_dev_ai_agents
+EOF
+
+    assert_run_success
+    assert_output_contains "active version unknown · skipping cleanup"
+    assert_output_not_contains "SAFE_CLEAN:"
+}
+
+@test "clean_dev_ai_agents skips Claude Desktop bundled versions when sdk version is path-like" {
+    local claude_support="$HOME/Library/Application Support/Claude"
+    mkdir -p "$claude_support/claude-code/2.1.140" "$claude_support/claude-code/2.1.150"
+    mkdir -p "$claude_support/claude-code-vm/2.1.140" "$claude_support/claude-code-vm/2.1.150"
+    echo "../2.1.150" > "$claude_support/claude-code-vm/.sdk-version"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
+pgrep() { return 1; }
+clean_dev_ai_agents
+EOF
+
+    assert_run_success
+    assert_output_contains "active version unknown · skipping cleanup"
+    assert_output_not_contains "SAFE_CLEAN:"
+}
+
+@test "clean_dev_ai_agents skips Claude Desktop cleanup when active version is missing from one bundled root" {
+    local claude_support="$HOME/Library/Application Support/Claude"
+    mkdir -p "$claude_support/claude-code/2.1.140" "$claude_support/claude-code/2.1.142"
+    mkdir -p "$claude_support/claude-code-vm/2.1.140" "$claude_support/claude-code-vm/2.1.142" "$claude_support/claude-code-vm/2.1.150"
+    echo "2.1.150" > "$claude_support/claude-code-vm/.sdk-version"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
+pgrep() { return 1; }
+clean_dev_ai_agents
+EOF
+
+    assert_run_success
+    assert_output_contains "active version unknown · skipping cleanup"
+    assert_output_not_contains "SAFE_CLEAN:"
+}
+
+@test "clean_dev_ai_agents skips Claude Desktop cleanup when only one bundled root can identify active version" {
+    local claude_support="$HOME/Library/Application Support/Claude"
+    mkdir -p "$claude_support/claude-code/2.1.140" "$claude_support/claude-code/2.1.150"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
+pgrep() { return 1; }
+clean_dev_ai_agents
+EOF
+
+    assert_run_success
+    assert_output_contains "active version unknown · skipping cleanup"
+    assert_output_not_contains "SAFE_CLEAN:"
+}
+
+@test "clean_dev_ai_agents skips Claude Desktop bundled versions while Claude Desktop is running" {
+    local claude_support="$HOME/Library/Application Support/Claude"
+    mkdir -p "$claude_support/claude-code/2.1.140" "$claude_support/claude-code/2.1.150"
+    mkdir -p "$claude_support/claude-code-vm/2.1.140" "$claude_support/claude-code-vm/2.1.150"
+    echo "2.1.150" > "$claude_support/claude-code-vm/.sdk-version"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
+pgrep() {
+    [[ "$1" == "-x" && "$2" == "Claude" ]]
+}
+clean_dev_ai_agents
+EOF
+
+    assert_run_success
+    assert_output_contains "Claude Desktop bundled Claude Code cleanup skipped · Claude Desktop is running"
+    assert_output_not_contains "SAFE_CLEAN:"
 }

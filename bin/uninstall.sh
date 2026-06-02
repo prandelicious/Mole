@@ -35,7 +35,6 @@ readonly MOLE_UNINSTALL_META_CACHE_DIR="$HOME/.cache/mole"
 readonly MOLE_UNINSTALL_META_CACHE_FILE="$MOLE_UNINSTALL_META_CACHE_DIR/uninstall_app_metadata_v1"
 readonly MOLE_UNINSTALL_META_CACHE_LOCK="${MOLE_UNINSTALL_META_CACHE_FILE}.lock"
 readonly MOLE_UNINSTALL_META_REFRESH_TTL=604800 # 7 days
-readonly MOLE_UNINSTALL_SCAN_SPINNER_DELAY_SEC="0.25"
 readonly MOLE_UNINSTALL_INLINE_METADATA_LIMIT="${MOLE_UNINSTALL_INLINE_METADATA_LIMIT:-0}"
 readonly MOLE_UNINSTALL_EPOCH_FLOOR=978307200
 readonly MOLE_UNINSTALL_INLINE_MDLS_TIMEOUT_SEC="${MOLE_UNINSTALL_INLINE_MDLS_TIMEOUT_SEC:-0.08}"
@@ -711,32 +710,6 @@ _scan_resolve_uncached() {
 
     update_scan_status "Scanning applications..." "0" "$total_apps"
 
-    (
-        # shellcheck disable=SC2329  # Function invoked indirectly via trap
-        cleanup_spinner() { exit 0; }
-        trap cleanup_spinner TERM INT EXIT
-        sleep "$MOLE_UNINSTALL_SCAN_SPINNER_DELAY_SEC" 2> /dev/null || sleep 1
-        [[ -f "$scan_status_file" ]] || exit 0
-        local spinner_chars="|/-\\"
-        local i=0
-        : > "$spinner_shown_file"
-        while true; do
-            local status_line status_message status_completed status_total
-            status_line=$(cat "$scan_status_file" 2> /dev/null || echo "")
-            IFS='|' read -r status_message status_completed status_total <<< "$status_line"
-            [[ -z "$status_message" ]] && status_message="Scanning applications..."
-            local c="${spinner_chars:$((i % 4)):1}"
-            if [[ "$status_completed" =~ ^[0-9]+$ && "$status_total" =~ ^[0-9]+$ && $status_total -gt 0 ]]; then
-                printf "\r\033[K%s %s %d/%d" "$c" "$status_message" "$status_completed" "$status_total" >&2
-            else
-                printf "\r\033[K%s %s" "$c" "$status_message" >&2
-            fi
-            ((i++))
-            sleep 0.1 2> /dev/null || sleep 1
-        done
-    ) &
-    spinner_pid=$!
-
     # Skip Pass 2 when the warm cache already wrote every row to $scan_raw_file.
     # Also avoids expanding an empty array — macOS bash 3.2 (the /bin/bash that
     # this script targets) treats `"${empty[@]}"` as unbound under `set -u`.
@@ -756,6 +729,74 @@ _scan_resolve_uncached() {
         for pid in "${pids[@]}"; do
             wait "$pid" 2> /dev/null
         done
+    fi
+}
+
+# Phase 6: collapse duplicate bundle IDs discovered from backup volumes or
+# mirrored Applications folders. Keep the live app locations first.
+_scan_dedupe_bundle_ids() {
+    [[ -s "$scan_raw_file" ]] || return 0
+
+    local deduped_file="${scan_raw_file}.deduped"
+    if ! awk -F'|' -v home_apps="$HOME/Applications/" '
+        function starts_with(value, prefix) {
+            return prefix != "" && substr(value, 1, length(prefix)) == prefix
+        }
+        function direct_app_under(path, prefix, rest) {
+            if (!starts_with(path, prefix)) {
+                return 0
+            }
+            rest = substr(path, length(prefix) + 1)
+            return index(rest, "/") == 0 && rest ~ /[.]app$/
+        }
+        function path_rank(path) {
+            if (direct_app_under(path, "/Applications/")) {
+                return 1
+            }
+            if (direct_app_under(path, home_apps)) {
+                return 2
+            }
+            if (starts_with(path, "/Volumes/")) {
+                return 4
+            }
+            return 3
+        }
+        {
+            bundle_id = $3
+            if (bundle_id == "" || bundle_id == "unknown") {
+                key = "__path__" NR
+                rows[key] = $0
+                order[++count] = key
+                next
+            }
+
+            rank = path_rank($1)
+            if (!(bundle_id in rows)) {
+                rows[bundle_id] = $0
+                ranks[bundle_id] = rank
+                order[++count] = bundle_id
+                next
+            }
+            if (rank < ranks[bundle_id]) {
+                rows[bundle_id] = $0
+                ranks[bundle_id] = rank
+            }
+        }
+        END {
+            for (i = 1; i <= count; i++) {
+                key = order[i]
+                if (key in rows) {
+                    print rows[key]
+                }
+            }
+        }
+    ' "$scan_raw_file" > "$deduped_file"; then
+        rm -f "$deduped_file" 2> /dev/null || true
+        return 0
+    fi
+
+    if ! mv "$deduped_file" "$scan_raw_file" 2> /dev/null; then
+        rm -f "$deduped_file" 2> /dev/null || true
     fi
 }
 
@@ -1101,6 +1142,35 @@ scan_applications() {
         printf "%s|%s|%s\n" "$message" "$completed" "$total" > "$scan_status_file"
     }
 
+    start_scan_spinner() {
+        [[ -n "$spinner_pid" ]] && return 0
+        [[ -t 2 || "${MOLE_TEST_FORCE_SCAN_SPINNER:-0}" == "1" ]] || return 0
+        (
+            # shellcheck disable=SC2329  # Function invoked indirectly via trap
+            cleanup_spinner() { exit 0; }
+            trap cleanup_spinner TERM INT EXIT
+            [[ -f "$scan_status_file" ]] || exit 0
+            local spinner_chars="|/-\\"
+            local i=0
+            : > "$spinner_shown_file"
+            while true; do
+                local status_line status_message status_completed status_total
+                status_line=$(cat "$scan_status_file" 2> /dev/null || echo "")
+                IFS='|' read -r status_message status_completed status_total <<< "$status_line"
+                [[ -z "$status_message" ]] && status_message="Scanning applications..."
+                local c="${spinner_chars:$((i % 4)):1}"
+                if [[ "$status_completed" =~ ^[0-9]+$ && "$status_total" =~ ^[0-9]+$ && $status_total -gt 0 ]]; then
+                    printf "\r\033[K%s %s %d/%d" "$c" "$status_message" "$status_completed" "$status_total" >&2
+                else
+                    printf "\r\033[K%s %s" "$c" "$status_message" >&2
+                fi
+                ((i++))
+                sleep 0.1 2> /dev/null || sleep 1
+            done
+        ) &
+        spinner_pid=$!
+    }
+
     stop_scan_spinner() {
         if [[ -n "$spinner_pid" ]]; then
             kill -TERM "$spinner_pid" 2> /dev/null || true
@@ -1113,6 +1183,9 @@ scan_applications() {
         rm -f "$spinner_shown_file" "$scan_status_file" 2> /dev/null || true
     }
 
+    update_scan_status "Scanning applications..." "0" "0"
+    start_scan_spinner
+
     # Phase 2: discover candidate apps.
     _scan_discover_apps
 
@@ -1122,6 +1195,7 @@ scan_applications() {
 
     # Phase 4: bail out if discovery yielded nothing.
     if [[ ${#app_data_tuples[@]} -eq 0 && ! -s "$scan_raw_file" ]]; then
+        stop_scan_spinner
         rm -f "$temp_file" "$scan_raw_file" "$merged_file" "$refresh_file" "$cache_snapshot_file" "$discovered_file" "$cached_rows_file" "$uncached_rows_file" "$scan_status_file" "${temp_file}.sorted" "$spinner_shown_file" 2> /dev/null || true
         [[ $cache_source_is_temp == true ]] && rm -f "$cache_source" 2> /dev/null || true
         restore_scan_int_trap
@@ -1143,6 +1217,8 @@ scan_applications() {
         restore_scan_int_trap
         return 1
     fi
+
+    _scan_dedupe_bundle_ids
 
     # Phase 7+8: merge cache, persist, sort, return path.
     _scan_finalize_index
@@ -1564,7 +1640,7 @@ main() {
         # Keystrokes typed during the scan/load phase must not leak into the
         # selector. A queued Enter would confirm whichever app is highlighted
         # first and drop the user straight into the destructive path. See #726.
-        drain_pending_input
+        drain_pending_input 0.2
 
         set +e
         select_apps_for_uninstall

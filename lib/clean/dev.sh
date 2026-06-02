@@ -400,6 +400,16 @@ check_rust_toolchains() {
         "rustup toolchain list"
 }
 # Docker caches (guarded by daemon check).
+find_orbstack_data_dir() {
+    local candidate
+    for candidate in "$HOME"/Library/Group\ Containers/*dev.orbstack/data; do
+        [[ -d "$candidate" ]] || continue
+        printf '%s\n' "$candidate"
+        return 0
+    done
+    return 1
+}
+
 clean_dev_docker() {
     if command -v docker > /dev/null 2>&1; then
         note_activity
@@ -407,6 +417,21 @@ clean_dev_docker() {
         echo -e "  ${GRAY}${ICON_REVIEW}${NC} ${GRAY}Review: docker system df${NC}"
         echo -e "  ${GRAY}${ICON_REVIEW}${NC} ${GRAY}Prune:  docker system prune --filter until=720h${NC}"
         debug_log "Docker daemon-managed cleanup skipped by default"
+    fi
+
+    local orb_data=""
+    orb_data=$(find_orbstack_data_dir 2> /dev/null || true)
+    if command -v orb > /dev/null 2>&1 || command -v orbctl > /dev/null 2>&1 || [[ -d "$HOME/.orbstack" || -n "$orb_data" ]]; then
+        local orb_size=0
+        if [[ -n "$orb_data" ]]; then
+            orb_size=$(get_path_size_kb "$orb_data" 2> /dev/null || echo 0)
+            [[ "$orb_size" =~ ^[0-9]+$ ]] || orb_size=0
+        fi
+        note_activity
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} OrbStack container data · skipped by default ($(bytes_to_human $((orb_size * 1024))))"
+        echo -e "  ${GRAY}${ICON_REVIEW}${NC} ${GRAY}Review: docker system df${NC}"
+        echo -e "  ${GRAY}${ICON_REVIEW}${NC} ${GRAY}Prune:  docker system prune --filter until=720h${NC}"
+        debug_log "OrbStack daemon-managed data left for manual prune ($orb_size KB)"
     fi
     safe_clean ~/.docker/buildx/cache/* "Docker BuildX cache"
 }
@@ -1194,6 +1219,174 @@ clean_ai_agent_old_entries() {
 # plus the version pointed at by the active CLI symlink (mtime alone is
 # unreliable: Claude Code pre-downloads the next version before flipping
 # the symlink, so newest mtime is not always the active version).
+clean_versioned_agent_root() {
+    local versions_root="$1"
+    local label="$2"
+    local keep_previous="$3"
+    local active_path="${4:-}"
+
+    [[ -d "$versions_root" ]] || return 0
+
+    local -a entries=()
+    local entry
+    while IFS= read -r -d '' entry; do
+        local name
+        name=$(basename "$entry")
+        [[ "$name" == .* ]] && continue
+        [[ ! "$name" =~ ^[0-9] ]] && continue
+        entries+=("$entry")
+    done < <(command find "$versions_root" -mindepth 1 -maxdepth 1 \( -type f -o -type d \) -print0 2> /dev/null)
+
+    [[ ${#entries[@]} -le "$keep_previous" ]] && return 0
+
+    local -a sorted=()
+    local line
+    while IFS= read -r line; do
+        sorted+=("${line#* }")
+    done < <(
+        local version_entry
+        for version_entry in "${entries[@]}"; do
+            local mtime
+            mtime=$(stat -f%m "$version_entry" 2> /dev/null || echo "0")
+            printf '%s %s\n' "$mtime" "$version_entry"
+        done | sort -rn
+    )
+
+    local idx=0
+    local target
+    for target in "${sorted[@]}"; do
+        if [[ -n "$active_path" && "$target" == "$active_path" ]]; then
+            continue
+        fi
+        if [[ $idx -lt $keep_previous ]]; then
+            idx=$((idx + 1))
+            continue
+        fi
+        safe_clean "$target" "$label"
+        note_activity
+        idx=$((idx + 1))
+    done
+}
+
+count_versioned_agent_entries() {
+    local versions_root="$1"
+    local count=0
+    local entry
+
+    [[ -d "$versions_root" ]] || {
+        echo 0
+        return 0
+    }
+
+    while IFS= read -r -d '' entry; do
+        local name
+        name=$(basename "$entry")
+        [[ "$name" == .* ]] && continue
+        [[ ! "$name" =~ ^[0-9] ]] && continue
+        count=$((count + 1))
+    done < <(command find "$versions_root" -mindepth 1 -maxdepth 1 \( -type f -o -type d \) -print0 2> /dev/null)
+
+    echo "$count"
+}
+
+claude_desktop_sdk_version_is_safe() {
+    local sdk_version="${1:-}"
+
+    [[ -n "$sdk_version" ]] || return 1
+    [[ "$sdk_version" == .* ]] && return 1
+    [[ "$sdk_version" == *"/"* ]] && return 1
+    [[ "$sdk_version" == *".."* ]] && return 1
+    [[ "$sdk_version" =~ ^[0-9] ]] || return 1
+    return 0
+}
+
+claude_desktop_running() {
+    command -v pgrep > /dev/null 2>&1 || return 1
+
+    pgrep -x "Claude" > /dev/null 2>&1 && return 0
+    pgrep -f "/Claude.app/" > /dev/null 2>&1 && return 0
+    return 1
+}
+
+claude_desktop_sdk_version() {
+    local claude_support="$1"
+    local sdk_file="$claude_support/claude-code-vm/.sdk-version"
+    [[ -f "$sdk_file" ]] || return 1
+
+    local sdk_version
+    sdk_version=$(head -n 1 "$sdk_file" 2> /dev/null | LC_ALL=C tr -d '[:space:]' || true)
+    claude_desktop_sdk_version_is_safe "$sdk_version" || return 1
+
+    printf '%s\n' "$sdk_version"
+}
+
+clean_claude_desktop_bundled_versions() {
+    local keep_previous="$1"
+    local claude_support="$HOME/Library/Application Support/Claude"
+    [[ -d "$claude_support" ]] || return 0
+
+    local -a desktop_specs=(
+        "$claude_support/claude-code|Claude Desktop bundled Claude Code old version"
+        "$claude_support/claude-code-vm|Claude Desktop bundled Claude Code VM old version"
+    )
+
+    local has_multiple_versions=false
+    local spec
+    for spec in "${desktop_specs[@]}"; do
+        local versions_root="${spec%%|*}"
+        [[ -d "$versions_root" ]] || continue
+
+        local version_count
+        version_count=$(count_versioned_agent_entries "$versions_root")
+        [[ "$version_count" =~ ^[0-9]+$ ]] || version_count=0
+        if [[ "$version_count" -gt 1 ]]; then
+            has_multiple_versions=true
+            break
+        fi
+    done
+
+    [[ "$has_multiple_versions" == "true" ]] || return 0
+
+    if claude_desktop_running; then
+        note_activity
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Claude Desktop bundled Claude Code cleanup skipped · Claude Desktop is running"
+        return 0
+    fi
+
+    local sdk_version=""
+    sdk_version=$(claude_desktop_sdk_version "$claude_support" || true)
+    if [[ -z "$sdk_version" ]]; then
+        note_activity
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Claude Desktop bundled Claude Code active version unknown · skipping cleanup"
+        return 0
+    fi
+
+    for spec in "${desktop_specs[@]}"; do
+        local versions_root="${spec%%|*}"
+        local label="${spec#*|}"
+        [[ -d "$versions_root" ]] || continue
+
+        if [[ ! -e "$versions_root/$sdk_version" ]]; then
+            note_activity
+            echo -e "  ${GRAY}${ICON_WARNING}${NC} $label active version unknown · skipping cleanup"
+            return 0
+        fi
+    done
+
+    for spec in "${desktop_specs[@]}"; do
+        local versions_root="${spec%%|*}"
+        local label="${spec#*|}"
+        [[ -d "$versions_root" ]] || continue
+
+        local version_count
+        version_count=$(count_versioned_agent_entries "$versions_root")
+        [[ "$version_count" =~ ^[0-9]+$ ]] || version_count=0
+        [[ "$version_count" -le 1 ]] && continue
+
+        clean_versioned_agent_root "$versions_root" "$label" "$keep_previous" "$versions_root/$sdk_version"
+    done
+}
+
 clean_dev_ai_agents() {
     local keep_previous="${MOLE_AI_AGENTS_KEEP:-1}"
     [[ "$keep_previous" =~ ^[0-9]+$ ]] || keep_previous=1
@@ -1241,43 +1434,7 @@ clean_dev_ai_agents() {
             fi
         fi
 
-        local -a entries=()
-        while IFS= read -r -d '' entry; do
-            local name
-            name=$(basename "$entry")
-            [[ "$name" == .* ]] && continue
-            [[ ! "$name" =~ ^[0-9] ]] && continue
-            entries+=("$entry")
-        done < <(command find "$versions_root" -mindepth 1 -maxdepth 1 \( -type f -o -type d \) -print0 2> /dev/null)
-
-        [[ ${#entries[@]} -le "$keep_previous" ]] && continue
-
-        local -a sorted=()
-        while IFS= read -r line; do
-            sorted+=("${line#* }")
-        done < <(
-            local entry
-            for entry in "${entries[@]}"; do
-                local mtime
-                mtime=$(stat -f%m "$entry" 2> /dev/null || echo "0")
-                printf '%s %s\n' "$mtime" "$entry"
-            done | sort -rn
-        )
-
-        local idx=0
-        local target
-        for target in "${sorted[@]}"; do
-            if [[ -n "$active_path" && "$target" == "$active_path" ]]; then
-                continue
-            fi
-            if [[ $idx -lt $keep_previous ]]; then
-                idx=$((idx + 1))
-                continue
-            fi
-            safe_clean "$target" "$label"
-            note_activity
-            idx=$((idx + 1))
-        done
+        clean_versioned_agent_root "$versions_root" "$label" "$keep_previous" "$active_path"
     done
 
     # Codex: keep auth, config, history, SQLite state, and active sessions.
@@ -1303,6 +1460,8 @@ clean_dev_ai_agents() {
     safe_clean "$HOME/.cache/gemini-cli"/* "Gemini CLI cache"
     safe_clean "$HOME/.gemini/tmp"/* "Gemini CLI temporary files"
     safe_clean "$HOME/.continue/cache"/* "Continue cache"
+
+    clean_claude_desktop_bundled_versions "$keep_previous"
 }
 
 # Other language tool caches.
@@ -1469,22 +1628,21 @@ clean_codex_runtimes() {
     done < <(command find "$runtime_root" -mindepth 1 -maxdepth 1 -type d -print0 2> /dev/null)
 }
 
-# Codex CLI working directory: rebuildable cache, temp, and log files.
-# Conversation state (sessions, *.sqlite, history.jsonl, credentials) is
-# intentionally left untouched - see issue #913.
+# Codex CLI and Desktop share state under ~/.codex. Keep it out of default
+# cleanup so app indexes, sessions, credentials, and local thread state survive.
 clean_codex_cli() {
     local codex_root="$HOME/.codex"
     [[ -d "$codex_root" ]] || return 0
 
     if codex_running; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Codex CLI caches · skipped (Codex running)"
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Codex CLI state · skipped (Codex running)"
         note_activity
         return 0
     fi
 
-    safe_clean "$codex_root/cache"/* "Codex CLI cache"
-    safe_clean "$codex_root/.tmp"/* "Codex CLI temp files"
-    safe_clean "$codex_root/log"/* "Codex CLI logs"
+    echo -e "  ${GRAY}${ICON_WARNING}${NC} Codex CLI state · skipped by default"
+    note_activity
+    debug_log "Codex CLI state left intact by default: $codex_root"
 }
 
 # Shared Chromium Default profile caches that are safe to regenerate.
@@ -1544,6 +1702,118 @@ clean_chrome_devtools_mcp_caches() {
 
     if declare -f clean_service_worker_cache > /dev/null 2>&1; then
         clean_service_worker_cache "Chrome DevTools MCP" "$mcp_profile/Default/Service Worker/CacheStorage"
+    fi
+}
+
+# Project roots scanned for agent worktrees. Override with a colon-separated
+# MOLE_AGENT_WORKTREE_PATHS list (e.g. "$HOME/work:$HOME/oss").
+agent_worktree_search_roots() {
+    if [[ -n "${MOLE_AGENT_WORKTREE_PATHS:-}" ]]; then
+        local saved_ifs="$IFS"
+        IFS=':'
+        # shellcheck disable=SC2206
+        local -a custom=($MOLE_AGENT_WORKTREE_PATHS)
+        IFS="$saved_ifs"
+        [[ ${#custom[@]} -gt 0 ]] && printf '%s\n' "${custom[@]}"
+        return 0
+    fi
+    printf '%s\n' \
+        "$HOME/code" "$HOME/Code" "$HOME/dev" "$HOME/Projects" \
+        "$HOME/GitHub" "$HOME/Workspace" "$HOME/Repos" \
+        "$HOME/Development" "$HOME/www" "$HOME/src"
+}
+
+# Returns 0 only when a worktree is safe to remove: no uncommitted or untracked
+# changes, and no commits reachable from HEAD that are missing from every
+# remote-tracking ref. A repo with no remotes therefore keeps every worktree,
+# which is the intended conservative behavior.
+agent_worktree_is_disposable() {
+    local wt="$1"
+    run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" git -C "$wt" rev-parse --is-inside-work-tree > /dev/null 2>&1 || return 1
+    if [[ -n "$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" git -C "$wt" status --porcelain 2> /dev/null)" ]]; then
+        return 1
+    fi
+    # A clean, pushed worktree can still hold stashed work; keep it if so.
+    if [[ -n "$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" git -C "$wt" stash list 2> /dev/null)" ]]; then
+        return 1
+    fi
+    local local_only
+    local_only=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" git -C "$wt" rev-list --count HEAD --not --remotes 2> /dev/null || echo 1)
+    [[ "$local_only" =~ ^[0-9]+$ ]] || return 1
+    [[ "$local_only" -eq 0 ]] || return 1
+    return 0
+}
+
+# AI coding agents (Claude Code and similar) create isolated git worktrees under
+# <project>/.claude/worktrees/ for background or parallel runs. Each is a full
+# checkout (node_modules, build output, and so on) that is never cleaned up
+# automatically, so they accumulate across projects. They may also hold
+# uncommitted or unpushed work, so this is skipped by default. Set
+# MOLE_AGENT_WORKTREES=1 to remove only the worktrees that are fully clean.
+clean_dev_agent_worktrees() {
+    local scan_timeout=20
+
+    local -a containers=()
+    local root container
+    while IFS= read -r root; do
+        [[ -d "$root" ]] || continue
+        while IFS= read -r -d '' container; do
+            containers+=("$container")
+        done < <(run_with_timeout "$scan_timeout" command find "$root" -maxdepth 6 -type d -path "*/.claude/worktrees" -prune -print0 2> /dev/null)
+    done < <(agent_worktree_search_roots)
+
+    [[ ${#containers[@]} -gt 0 ]] || return 0
+
+    local force="${MOLE_AGENT_WORKTREES:-}"
+
+    # Default: report reclaimable size only, never delete (may hold agent work).
+    if [[ -z "$force" || "$force" == "0" ]]; then
+        local total_kb=0 size_kb=0 count=0 wt
+        for container in "${containers[@]}"; do
+            while IFS= read -r -d '' wt; do
+                size_kb=$(get_path_size_kb "$wt" 2> /dev/null || echo 0)
+                [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
+                total_kb=$((total_kb + size_kb))
+                count=$((count + 1))
+            done < <(command find "$container" -mindepth 1 -maxdepth 1 -type d -print0 2> /dev/null)
+        done
+        [[ "$count" -gt 0 ]] || return 0
+        note_activity
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} AI agent worktrees · skipped by default ($count in .claude/worktrees, $(bytes_to_human $((total_kb * 1024))))"
+        echo -e "  ${GRAY}${ICON_REVIEW}${NC} ${GRAY}Remove clean worktrees: MOLE_AGENT_WORKTREES=1 mo clean${NC}"
+        debug_log "AI agent worktrees left intact by default ($count dirs, $total_kb KB)"
+        return 0
+    fi
+
+    # Opt-in: remove only fully clean worktrees; keep anything with unsaved work.
+    local parent_repo kept=0
+    local wt
+    for container in "${containers[@]}"; do
+        parent_repo="${container%/.claude/worktrees}"
+        while IFS= read -r -d '' wt; do
+            if should_protect_path "$wt"; then
+                continue
+            fi
+            if agent_worktree_is_disposable "$wt"; then
+                safe_clean "$wt" "AI agent worktree"
+                # Tidy the parent repo's worktree registry once the dir is gone.
+                # In dry-run the directory remains, so prune is skipped. Agent
+                # worktrees are usually git-locked, and a plain prune skips a
+                # locked entry even when its directory is missing, so unlock it
+                # first and prune with --expire=now to drop the stale entry.
+                if [[ ! -d "$wt" && -e "$parent_repo/.git" ]]; then
+                    run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" git -C "$parent_repo" worktree unlock "$wt" > /dev/null 2>&1 || true
+                    run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" git -C "$parent_repo" worktree prune --expire=now > /dev/null 2>&1 || true
+                fi
+            else
+                kept=$((kept + 1))
+                note_activity
+                echo -e "  ${GRAY}${ICON_REVIEW}${NC} ${GRAY}Kept agent worktree (unsaved work): ${wt/#$HOME/~}${NC}"
+            fi
+        done < <(command find "$container" -mindepth 1 -maxdepth 1 -type d -print0 2> /dev/null)
+    done
+    if [[ "$kept" -gt 0 ]]; then
+        debug_log "Kept $kept AI agent worktree(s) with unsaved work"
     fi
 }
 
@@ -1654,37 +1924,6 @@ clean_dev_haskell() {
 clean_dev_ocaml() {
     safe_clean ~/.opam/download-cache/* "Opam cache"
 }
-# Editor caches.
-# Note: ~/Library/Application Support/Code/User/workspaceStorage contains workspace settings - excluded from cleanup
-clean_dev_editors() {
-    safe_clean ~/Library/Caches/com.microsoft.VSCode/Cache/* "VS Code cached data"
-    safe_clean ~/Library/Application\ Support/Code/CachedData/* "VS Code cached data"
-    safe_clean ~/Library/Application\ Support/Code/DawnGraphiteCache/* "VS Code Dawn cache"
-    safe_clean ~/Library/Application\ Support/Code/DawnWebGPUCache/* "VS Code WebGPU cache"
-    safe_clean ~/Library/Application\ Support/Code/GPUCache/* "VS Code GPU cache"
-    safe_clean ~/Library/Application\ Support/Code/CachedExtensionVSIXs/* "VS Code extension cache"
-    safe_clean ~/Library/Application\ Support/Code/WebStorage/* "VS Code WebStorage"
-    clean_service_worker_cache "VS Code" "$HOME/Library/Application Support/Code/Service Worker/CacheStorage"
-    if ! pgrep -x "Code" > /dev/null 2>&1; then
-        safe_clean ~/Library/Application\ Support/Code/Service\ Worker/ScriptCache/* "VS Code Service Worker ScriptCache"
-    fi
-    safe_clean ~/Library/Caches/Zed/* "Zed cache"
-    safe_clean ~/Library/Caches/copilot/* "GitHub Copilot cache"
-    safe_clean ~/.cache/vscode-ripgrep/* "VS Code ripgrep cache"
-    if [[ -d ~/Library/Application\ Support/Cursor ]]; then
-        safe_clean ~/Library/Caches/Cursor/* "Cursor cache"
-        safe_clean ~/Library/Application\ Support/Cursor/CachedData/* "Cursor cached data"
-        safe_clean ~/Library/Application\ Support/Cursor/CachedExtensionVSIXs/* "Cursor extension cache"
-        safe_clean ~/Library/Application\ Support/Cursor/WebStorage/* "Cursor WebStorage"
-        safe_clean ~/Library/Application\ Support/Cursor/GPUCache/* "Cursor GPU cache"
-        safe_clean ~/Library/Application\ Support/Cursor/DawnGraphiteCache/* "Cursor Dawn cache"
-        safe_clean ~/Library/Application\ Support/Cursor/DawnWebGPUCache/* "Cursor WebGPU cache"
-        clean_service_worker_cache "Cursor" "$HOME/Library/Application Support/Cursor/Service Worker/CacheStorage"
-        if ! pgrep -x "Cursor" > /dev/null 2>&1; then
-            safe_clean ~/Library/Application\ Support/Cursor/Service\ Worker/ScriptCache/* "Cursor Service Worker ScriptCache"
-        fi
-    fi
-}
 # Main developer tools cleanup sequence.
 clean_developer_tools() {
     stop_section_spinner
@@ -1710,6 +1949,7 @@ clean_developer_tools() {
     clean_dev_jetbrains_toolbox
     clean_dev_jetbrains_logs
     clean_dev_ai_agents
+    clean_dev_agent_worktrees
     clean_dev_other_langs
     clean_dev_cicd
     clean_dev_database

@@ -579,87 +579,6 @@ opt_launch_services_rebuild() {
     fi
 }
 
-# Font cache rebuild.
-browser_family_is_running() {
-    local browser_name="$1"
-
-    case "$browser_name" in
-        "Firefox")
-            pgrep -if "Firefox|org\\.mozilla\\.firefox|firefox .*contentproc|firefox .*plugin-container|firefox .*crashreporter" > /dev/null 2>&1
-            ;;
-        "Zen Browser")
-            pgrep -if "Zen Browser|org\\.mozilla\\.zen|Zen Browser Helper|zen .*contentproc" > /dev/null 2>&1
-            ;;
-        *)
-            pgrep -ix "$browser_name" > /dev/null 2>&1
-            ;;
-    esac
-}
-
-opt_font_cache_rebuild() {
-    if [[ "${MO_DEBUG:-}" == "1" ]]; then
-        debug_operation_start "Font Cache Rebuild" "Clear and rebuild font cache"
-        debug_operation_detail "Method" "Run atsutil databases -remove"
-        debug_operation_detail "Safety checks" "Skip when browsers or browser helpers are running to avoid cache rebuild conflicts"
-        debug_operation_detail "Expected outcome" "Fixed font display issues, removed corrupted font cache"
-        debug_risk_level "LOW" "System automatically rebuilds font database"
-    fi
-
-    local success=false
-
-    if [[ "${MOLE_DRY_RUN:-0}" != "1" ]]; then
-        # Some browsers can keep stale GPU/text caches in /var/folders if system font
-        # databases are reset while browser/helper processes are still running.
-        local -a running_browsers=()
-
-        local browser_name
-        local -a browser_checks=(
-            "Firefox"
-            "Safari"
-            "Google Chrome"
-            "Chromium"
-            "Brave Browser"
-            "Microsoft Edge"
-            "Arc"
-            "Opera"
-            "Vivaldi"
-            "Zen Browser"
-            "Helium"
-        )
-        for browser_name in "${browser_checks[@]}"; do
-            if browser_family_is_running "$browser_name"; then
-                running_browsers+=("$browser_name")
-            fi
-        done
-
-        if [[ ${#running_browsers[@]} -gt 0 ]]; then
-            local running_list
-            running_list=$(printf "%s, " "${running_browsers[@]}")
-            running_list="${running_list%, }"
-            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Font cache rebuild skipped · ${running_list} still running"
-            return 0
-        fi
-
-        if ! optimize_sudo_available; then
-            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Font cache rebuild skipped · admin access required"
-            return 0
-        fi
-
-        if sudo atsutil databases -remove > /dev/null 2>&1; then
-            success=true
-        fi
-    else
-        success=true
-    fi
-
-    if [[ "$success" == "true" ]]; then
-        opt_msg "Font cache cleared"
-        opt_msg "System will rebuild font database automatically"
-    else
-        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to clear font cache"
-    fi
-}
-
 # Removed high-risk optimizations:
 # - opt_startup_items_cleanup: Risk of deleting legitimate app helpers
 # - opt_dyld_cache_update: Low benefit, time-consuming, auto-managed by macOS
@@ -856,19 +775,72 @@ opt_spotlight_index_optimize() {
     fi
 }
 
-# Dock cache refresh.
-opt_dock_refresh() {
-    local dock_support="$HOME/Library/Application Support/Dock"
-    local refreshed=false
+# Remove orphaned Spotlight search-rule entries.
+# Uninstalling an app (especially Mac App Store apps that synced via iCloud)
+# can leave its bundle id behind in com.apple.spotlight EnabledPreferenceRules,
+# showing up as a dead row in System Settings > Spotlight (#1000). macOS never
+# prunes these, so we drop entries whose app is no longer installed.
+opt_prune_spotlight_orphan_rules() {
+    local domain="com.apple.spotlight"
+    local plist="$HOME/Library/Preferences/${domain}.plist"
 
-    if [[ -d "$dock_support" ]]; then
-        while IFS= read -r db_file; do
-            if [[ -f "$db_file" ]]; then
-                safe_remove "$db_file" true > /dev/null 2>&1 && refreshed=true
-            fi
-        done < <(command find "$dock_support" -name "*.db" -type f 2> /dev/null || true)
+    if ! defaults read "$domain" EnabledPreferenceRules &> /dev/null; then
+        opt_msg "Spotlight search rules already clean"
+        return 0
     fi
 
+    local -a keep=() removed=()
+    local i=0 entry
+    while entry=$(/usr/libexec/PlistBuddy -c "Print :EnabledPreferenceRules:$i" "$plist" 2> /dev/null); do
+        case "$entry" in
+            # Never touch system or Apple rules (e.g. System.iphoneApps); these
+            # pass the reverse-DNS shape check but are not removable app bundles.
+            System.* | com.apple.*)
+                keep+=("$entry")
+                ;;
+            *)
+                # Only act on well-formed bundle ids; bundle_has_installed_app
+                # double-checks with mdfind and a filesystem scan, so a return of
+                # 1 means the app is genuinely gone. Anything else is kept.
+                if mole_is_reverse_dns_bundle_id "$entry" && ! bundle_has_installed_app "$entry"; then
+                    removed+=("$entry")
+                else
+                    keep+=("$entry")
+                fi
+                ;;
+        esac
+        i=$((i + 1))
+    done
+
+    if [[ ${#removed[@]} -eq 0 ]]; then
+        opt_msg "Spotlight search rules already clean"
+        return 0
+    fi
+
+    if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
+        opt_msg "Would remove ${#removed[@]} orphan Spotlight rule(s)"
+        return 0
+    fi
+
+    # Rewrite the filtered array through cfprefsd (defaults), not by deleting
+    # plist indices in place: this avoids the cfprefsd cache overwriting a direct
+    # file edit, and ensures System Settings reflects the change and it persists.
+    if [[ ${#keep[@]} -gt 0 ]]; then
+        defaults write "$domain" EnabledPreferenceRules -array "${keep[@]}" 2> /dev/null || true
+    else
+        defaults delete "$domain" EnabledPreferenceRules 2> /dev/null || true
+    fi
+
+    opt_msg "Removed ${#removed[@]} orphan Spotlight rule(s)"
+}
+
+# Dock refresh (restart Dock so plist edits take effect).
+# The previous implementation also wiped every "*.db" under
+# ~/Library/Application Support/Dock, which deleted macOS's
+# desktoppicture.db and reset the user's wallpaper (#995). No .db under
+# that directory needs to be cleared for Dock to refresh — killall plus
+# touching the plist is sufficient.
+opt_dock_refresh() {
     local dock_plist="$HOME/Library/Preferences/com.apple.dock.plist"
     if [[ -f "$dock_plist" ]]; then
         touch "$dock_plist" 2> /dev/null || true
@@ -878,9 +850,6 @@ opt_dock_refresh() {
         killall Dock 2> /dev/null || true
     fi
 
-    if [[ "$refreshed" == "true" ]]; then
-        opt_msg "Dock cache cleared"
-    fi
     opt_msg "Dock refreshed"
 }
 
@@ -1402,13 +1371,13 @@ execute_optimization() {
         quarantine_cleanup) opt_quarantine_cleanup ;;
         sqlite_vacuum) opt_sqlite_vacuum ;;
         launch_services_rebuild) opt_launch_services_rebuild ;;
-        font_cache_rebuild) opt_font_cache_rebuild ;;
         dock_refresh) opt_dock_refresh ;;
         prevent_network_dsstore) opt_prevent_network_dsstore ;;
         memory_pressure_relief) opt_memory_pressure_relief ;;
         network_stack_optimize) opt_network_stack_optimize ;;
         disk_permissions_repair) opt_disk_permissions_repair ;;
         spotlight_index_optimize) opt_spotlight_index_optimize ;;
+        spotlight_orphan_rules_cleanup) opt_prune_spotlight_orphan_rules ;;
         launch_agents_cleanup) opt_launch_agents_cleanup ;;
         periodic_maintenance) opt_periodic_maintenance ;;
         shared_file_list_repair) opt_shared_file_list_repair ;;

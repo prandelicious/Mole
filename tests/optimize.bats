@@ -134,6 +134,50 @@ EOF
 	[[ "$output" != *"lint:$HOME/Library/Preferences/loginwindow.plist"* ]]
 }
 
+@test "fix_broken_preferences does not count safe_remove failures" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/maintenance.sh"
+
+prefs="$HOME/Library/Preferences"
+mkdir -p "$prefs"
+touch "$prefs/com.example.broken.plist"
+
+plutil() { return 1; }
+safe_remove() { return 1; }
+
+count=$(fix_broken_preferences)
+echo "count=$count"
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"count=0"* ]]
+}
+
+@test "fix_broken_preferences does not count protected Adobe plists" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MO_DEBUG=1 bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/maintenance.sh"
+
+prefs="$HOME/Library/Preferences"
+plist="$prefs/com.adobe.Photoshop.uxp_com.adobe.ccx.start.plist"
+mkdir -p "$prefs"
+touch "$plist"
+
+plutil() { return 1; }
+
+count=$(fix_broken_preferences)
+echo "count=$count"
+[[ -f "$plist" ]] && echo "still-present"
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"count=0"* ]]
+	[[ "$output" == *"still-present"* ]]
+}
+
 @test "opt_cache_refresh reuses measured cache sizes for deletion" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -240,85 +284,21 @@ EOF
 	[[ "$output" == *"sqlite3 unavailable"* ]]
 }
 
-@test "opt_font_cache_rebuild succeeds in dry-run" {
-	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 bash --noprofile --norc <<'EOF'
-set -euo pipefail
-source "$PROJECT_ROOT/lib/core/common.sh"
-source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-opt_font_cache_rebuild
-EOF
-
-	[ "$status" -eq 0 ]
-	[[ "$output" == *"Font cache cleared"* ]]
-}
-
 @test "optimize does not auto-fix Gatekeeper anymore" {
 	run grep -n "spctl --master-enable\\|SECURITY_FIXES+=([\"']gatekeeper|" "$PROJECT_ROOT/bin/optimize.sh"
 
 	[ "$status" -eq 1 ]
 }
 
-@test "opt_font_cache_rebuild skips when Firefox helpers are running" {
-	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
-set -euo pipefail
-source "$PROJECT_ROOT/lib/core/common.sh"
-source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-pgrep() {
-    case "$*" in
-        *"Firefox|org\\.mozilla\\.firefox|firefox .*contentproc|firefox .*plugin-container|firefox .*crashreporter"*)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-export -f pgrep
-opt_font_cache_rebuild
-EOF
-
-	[ "$status" -eq 0 ]
-	[[ "$output" == *"Font cache rebuild skipped · Firefox still running"* ]]
-}
-
-@test "browser_family_is_running does not treat generic renderer helpers as Zen Browser" {
-	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
-set -euo pipefail
-source "$PROJECT_ROOT/lib/core/common.sh"
-source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-pgrep() {
-    case "$*" in
-        *"renderer|gpu"*)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-export -f pgrep
-if browser_family_is_running "Zen Browser"; then
-    echo "MATCHED"
-fi
-EOF
-
-	[ "$status" -eq 0 ]
-	[[ "$output" != *"MATCHED"* ]]
-}
-
-@test "opt_dock_refresh clears cache files" {
+@test "opt_dock_refresh reports refresh" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-mkdir -p "$HOME/Library/Application Support/Dock"
-touch "$HOME/Library/Application Support/Dock/test.db"
-safe_remove() { return 0; }
 opt_dock_refresh
 EOF
 
 	[ "$status" -eq 0 ]
-	[[ "$output" == *"Dock cache cleared"* ]]
 	[[ "$output" == *"Dock refreshed"* ]]
 }
 
@@ -401,6 +381,124 @@ EOF
 
 	[ "$status" -eq 1 ]
 	[[ "$output" == *"Unknown action"* ]]
+}
+
+@test "opt_prune_spotlight_orphan_rules removes orphan but keeps system, apple and installed rules" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+PLIST="$HOME/Library/Preferences/com.apple.spotlight.plist"
+mkdir -p "$(dirname "$PLIST")"
+rm -f "$PLIST"
+/usr/libexec/PlistBuddy \
+    -c "Add :EnabledPreferenceRules array" \
+    -c "Add :EnabledPreferenceRules:0 string System.iphoneApps" \
+    -c "Add :EnabledPreferenceRules:1 string com.apple.Safari" \
+    -c "Add :EnabledPreferenceRules:2 string com.installed.App" \
+    -c "Add :EnabledPreferenceRules:3 string com.lm.william.TwinklingCard" \
+    "$PLIST" >/dev/null 2>&1
+defaults() {
+    case "$1" in
+        read) return 0 ;;
+        write | delete) echo "DEFAULTS: $*" ;;
+    esac
+}
+bundle_has_installed_app() { [[ "$1" == "com.installed.App" ]]; }
+opt_prune_spotlight_orphan_rules
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"Removed 1 orphan"* ]]
+	[[ "$output" == *"DEFAULTS: write"* ]]
+	[[ "$output" == *"System.iphoneApps"* ]]
+	[[ "$output" == *"com.apple.Safari"* ]]
+	[[ "$output" == *"com.installed.App"* ]]
+	[[ "$output" != *"com.lm.william.TwinklingCard"* ]]
+}
+
+@test "opt_prune_spotlight_orphan_rules dry-run reports but does not write" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+PLIST="$HOME/Library/Preferences/com.apple.spotlight.plist"
+mkdir -p "$(dirname "$PLIST")"
+rm -f "$PLIST"
+/usr/libexec/PlistBuddy \
+    -c "Add :EnabledPreferenceRules array" \
+    -c "Add :EnabledPreferenceRules:0 string System.iphoneApps" \
+    -c "Add :EnabledPreferenceRules:1 string com.lm.william.TwinklingCard" \
+    "$PLIST" >/dev/null 2>&1
+defaults() {
+    case "$1" in
+        read) return 0 ;;
+        write | delete) echo "DEFAULTS: $*" ;;
+    esac
+}
+bundle_has_installed_app() { return 1; }
+opt_prune_spotlight_orphan_rules
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"Would remove 1 orphan"* ]]
+	[[ "$output" != *"DEFAULTS: write"* ]]
+	[[ "$output" != *"DEFAULTS: delete"* ]]
+}
+
+@test "opt_prune_spotlight_orphan_rules reports clean when every rule still has its app" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+PLIST="$HOME/Library/Preferences/com.apple.spotlight.plist"
+mkdir -p "$(dirname "$PLIST")"
+rm -f "$PLIST"
+/usr/libexec/PlistBuddy \
+    -c "Add :EnabledPreferenceRules array" \
+    -c "Add :EnabledPreferenceRules:0 string System.iphoneApps" \
+    -c "Add :EnabledPreferenceRules:1 string com.apple.Safari" \
+    -c "Add :EnabledPreferenceRules:2 string com.installed.App" \
+    "$PLIST" >/dev/null 2>&1
+defaults() {
+    case "$1" in
+        read) return 0 ;;
+        write | delete) echo "DEFAULTS: $*" ;;
+    esac
+}
+bundle_has_installed_app() { return 0; }
+opt_prune_spotlight_orphan_rules
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"already clean"* ]]
+	[[ "$output" != *"DEFAULTS: write"* ]]
+}
+
+@test "opt_prune_spotlight_orphan_rules reports clean when rules key is absent" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+defaults() { return 1; }
+opt_prune_spotlight_orphan_rules
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"already clean"* ]]
+}
+
+@test "execute_optimization dispatches spotlight_orphan_rules_cleanup" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+opt_prune_spotlight_orphan_rules() { echo "pruned"; }
+execute_optimization spotlight_orphan_rules_cleanup
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"pruned"* ]]
 }
 
 @test "opt_launch_services_rebuild handles missing lsregister without exiting" {
@@ -699,6 +797,32 @@ EOF
 	[[ "$output" != *"Mounted image detach candidates:"* ]]
 }
 
+@test "run_optimize_diagnostics honors optimize whitelist paths for mounted images (#977)" {
+	mkdir -p "$HOME/.config/mole"
+	cat > "$HOME/.config/mole/whitelist_optimize" <<'EOF'
+system_maintenance
+/Volumes/EXT3/Mail/TB.dmg
+/Volumes/mail
+EOF
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 \
+		MOLE_OPTIMIZE_PS_SAMPLE_1=$'1 /usr/sbin/distnoted' \
+		MOLE_OPTIMIZE_PS_SAMPLE_2=$'1 /usr/sbin/distnoted' \
+		MOLE_OPTIMIZE_HDIUTIL_INFO=$'================================================\nimage-path      : /Volumes/EXT3/Mail/TB.dmg\n/dev/disk6s2               Apple_HFS                       /Volumes/mail\n' \
+		bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/manage/whitelist.sh"
+source "$PROJECT_ROOT/lib/optimize/diagnostics.sh"
+load_whitelist optimize
+run_optimize_diagnostics
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"No obvious sustained high-CPU bottleneck detected"* ]]
+	[[ "$output" != *"Mounted image detach candidates:"* ]]
+	[[ "$output" != *"Would offer detach"* ]]
+}
+
 @test "run_optimize_diagnostics stays quiet when nothing matches" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
 		MOLE_OPTIMIZE_PS_SAMPLE_1=$'4 /usr/sbin/distnoted\n3 /usr/libexec/coreaudiod' \
@@ -951,7 +1075,6 @@ mdutil() { echo "Indexing enabled."; }
 mdfind() { sleep 4; }
 get_epoch_seconds() { date +%s; }
 is_ac_power() { return 0; }
-browser_family_is_running() { return 1; }
 pgrep() { return 1; }
 system_profiler() { return 1; }
 plutil() { return 1; }
@@ -965,7 +1088,6 @@ stop_inline_spinner() { :; }
 opt_memory_pressure_relief 2>&1 || true
 opt_network_stack_optimize 2>&1 || true
 opt_disk_permissions_repair 2>&1 || true
-opt_font_cache_rebuild 2>&1 || true
 opt_periodic_maintenance 2>&1 || true
 flush_dns_cache 2>&1 || true
 
@@ -1146,6 +1268,26 @@ EOF
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"no_vpn"* ]]
+}
+
+@test "opt_dock_refresh preserves desktoppicture.db and other db files (#995)" {
+	local dock_support="$HOME/Library/Application Support/Dock"
+	mkdir -p "$dock_support"
+	: > "$dock_support/desktoppicture.db"
+	: > "$dock_support/another.db"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+killall() { return 0; }
+export -f killall
+opt_dock_refresh
+EOF
+
+	[ "$status" -eq 0 ]
+	[ -f "$HOME/Library/Application Support/Dock/desktoppicture.db" ]
+	[ -f "$HOME/Library/Application Support/Dock/another.db" ]
 }
 
 @test "opt_diag_parse_image_mount_pairs handles multiple blocks" {

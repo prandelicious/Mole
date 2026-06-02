@@ -12,51 +12,7 @@ readonly MOLE_APP_PROTECTION_DATA_LOADED=1
 
 # Application Management
 
-# ============================================================================
-# Performance Note:
-# - SYSTEM_CRITICAL_BUNDLES_FAST: Fast wildcard patterns for cleanup operations
-# - SYSTEM_CRITICAL_BUNDLES: Detailed list for uninstall protection (lazy-loaded)
-# ============================================================================
-
-# Fast patterns for cleanup operations (used by should_protect_data)
-# These wildcards provide adequate protection with minimal performance impact
-readonly SYSTEM_CRITICAL_BUNDLES_FAST=(
-    "com.apple.*"
-    "loginwindow"
-    "dock"
-    "systempreferences"
-    "finder"
-    "safari"
-    "backgroundtaskmanagement*"
-    "keychain*"
-    "security*"
-    "bluetooth*"
-    "wifi*"
-    "network*"
-    "tcc"
-    "notification*"
-    "accessibility*"
-    "universalaccess*"
-    "HIToolbox*"
-    "textinput*"
-    "TextInput*"
-    "keyboard*"
-    "Keyboard*"
-    "inputsource*"
-    "InputSource*"
-    "keylayout*"
-    "KeyLayout*"
-    "GlobalPreferences"
-    ".GlobalPreferences"
-    "org.pqrs.Karabiner*"
-    # CUPS printing subsystem ships with macOS; there is no parent .app to
-    # anchor it, so org.cups.* prefs always look "orphaned" to bundle-ID
-    # matching. Deleting them wipes the default printer and recent-printer
-    # list, which users see as lost saved printers. See #731.
-    "org.cups.*"
-)
-
-# Detailed list for uninstall protection
+# Detailed list for uninstall protection (lazy-loaded into SYSTEM_CRITICAL_REGEX).
 # Critical system components protected from uninstallation
 # Note: We explicitly list system components instead of using "com.apple.*" wildcard
 # to allow uninstallation of user-installed Apple apps (Xcode, Final Cut Pro, etc.)
@@ -382,6 +338,9 @@ readonly DATA_PROTECTED_BUNDLES=(
 
     # Docker & Virtualization
     "com.docker.docker"
+    "dev.orbstack.OrbStack"
+    "dev.orbstack.*"
+    "dev.kdrag0n.MacVirt"
     "com.getutm.UTM"
     "com.vmware.fusion"
     "com.parallels.desktop.*"
@@ -603,4 +562,24 @@ readonly DATA_PROTECTED_BUNDLES=(
     "com.setapp.DesktopClient"
     "com.devmate.*"
     "org.sparkle-project.Sparkle*"
+)
+
+# Dotdir / XDG state directory names that belong to standalone CLI tools
+# shipped independently of any same-named GUI app. find_app_files() must not
+# propose these for deletion even when uninstalling a GUI app whose display
+# name collides, because the CLI tool is a separate product.
+#
+# Issue #993: uninstalling Claude.app wiped ~/.claude (Claude Code CLI);
+# uninstalling OpenCode.app wiped ~/.local/share/opencode and the opencode
+# CLI binary. Case-insensitive APFS makes the collision worse: $HOME/.Claude
+# (built from app_name="Claude") aliases to $HOME/.claude.
+#
+# Match is lowercase + leading-dot-stripped, scoped to $HOME, $HOME/.config,
+# $HOME/.local/share, $HOME/.cache. Add new entries as the AI-tool ecosystem
+# produces more GUI/CLI namesakes.
+readonly INDEPENDENT_CLI_DOTDIR_NAMES=(
+    "claude"   # Claude Code CLI (Claude Desktop uses ~/Library/Application Support/Claude)
+    "opencode" # sst/opencode CLI
+    "codex"    # OpenAI codex CLI (Codex Desktop uses ~/Library/Application Support/Codex)
+    "gemini"   # Google gemini CLI
 )

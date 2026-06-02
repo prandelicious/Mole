@@ -265,6 +265,9 @@ _clean_darwin_user_runtime_dir() {
     )
 
     if [[ "$count" -lt "$max_items" ]]; then
+        # Same safety contract as the file loop above: parent vetted,
+        # find narrowed to current UID + age + -type d -empty, and safe_remove
+        # still validates. Do not re-add per-item should_protect_path here.
         while IFS= read -r -d '' item; do
             [[ -d "$item" && ! -L "$item" ]] || continue
             if [[ "${DRY_RUN:-false}" == "true" ]] || safe_remove "$item" true "0" > /dev/null 2>&1; then
@@ -691,56 +694,6 @@ clean_brave_old_versions() {
         total_items=$((total_items + 1))
         note_activity
     fi
-}
-
-scan_external_volumes() {
-    [[ -d "/Volumes" ]] || return 0
-    local -a candidate_volumes=()
-    local -a network_volumes=()
-    for volume in /Volumes/*; do
-        [[ -d "$volume" && -w "$volume" && ! -L "$volume" ]] || continue
-        [[ "$volume" == "/" || "$volume" == "/Volumes/Macintosh HD" ]] && continue
-        local protocol=""
-        protocol=$(run_with_timeout 1 command diskutil info "$volume" 2> /dev/null | grep -i "Protocol:" | awk '{print $2}' || echo "") # 1s: volume protocol probe, see lib/core/timeouts.sh
-        case "$protocol" in
-            SMB | NFS | AFP | CIFS | WebDAV)
-                network_volumes+=("$volume")
-                continue
-                ;;
-        esac
-        local fs_type=""
-        fs_type=$(run_with_timeout 1 command df -T "$volume" 2> /dev/null | tail -1 | awk '{print $2}' || echo "") # 1s: volume FS-type probe, see lib/core/timeouts.sh
-        case "$fs_type" in
-            nfs | smbfs | afpfs | cifs | webdav)
-                network_volumes+=("$volume")
-                continue
-                ;;
-        esac
-        candidate_volumes+=("$volume")
-    done
-    local volume_count=${#candidate_volumes[@]}
-    local network_count=${#network_volumes[@]}
-    if [[ $volume_count -eq 0 ]]; then
-        if [[ $network_count -gt 0 ]]; then
-            echo -e "  ${GRAY}${ICON_LIST}${NC} External volumes, ${network_count} network volumes skipped"
-            note_activity
-        fi
-        return 0
-    fi
-    start_section_spinner "Scanning $volume_count external volumes..."
-    for volume in "${candidate_volumes[@]}"; do
-        [[ -d "$volume" && -r "$volume" ]] || continue
-        local volume_trash="$volume/.Trashes"
-        if [[ -d "$volume_trash" && "$DRY_RUN" != "true" ]] && ! is_path_whitelisted "$volume_trash"; then
-            while IFS= read -r -d '' item; do
-                safe_remove "$item" true || true
-            done < <(command find "$volume_trash" -mindepth 1 -maxdepth 1 -print0 2> /dev/null || true)
-        fi
-        if [[ "$PROTECT_FINDER_METADATA" != "true" ]]; then
-            clean_ds_store_tree "$volume" "$(basename "$volume") volume, .DS_Store"
-        fi
-    done
-    stop_section_spinner
 }
 
 # Finder metadata (.DS_Store).
@@ -2120,7 +2073,10 @@ check_large_file_candidates() {
     _report_large_review_dir "Xcode archives (review only)" "$HOME/Library/Developer/Xcode/Archives"
     _report_large_review_dir "iOS backups (review only)" "$HOME/Library/Application Support/MobileSync/Backup"
     _report_large_review_dir "LM Studio models (review only)" "$HOME/.lmstudio/models"
-    _report_large_review_dir "OrbStack data (review only)" "$HOME/OrbStack"
+    local orbstack_data
+    for orbstack_data in "$HOME"/Library/Group\ Containers/*dev.orbstack/data "$HOME/OrbStack"; do
+        _report_large_review_dir "OrbStack data (review only)" "$orbstack_data"
+    done
     _report_large_review_dir "Lima data (review only)" "$HOME/.lima"
     _report_large_review_dir "Maven local repository (review only)" "$HOME/.m2/repository"
     _report_large_review_dir "pnpm store (review only)" "$HOME/Library/pnpm/store"

@@ -994,6 +994,9 @@ perform_cleanup() {
         total_size_cleaned=0
     fi
 
+    local initial_free_space_kb=""
+    local initial_free_space_display="Unknown"
+
     # Test mode skips expensive scans and returns minimal output.
     local test_mode_enabled=false
     if [[ -z "$EXTERNAL_VOLUME_TARGET" && "${MOLE_TEST_MODE:-0}" == "1" ]]; then
@@ -1031,7 +1034,11 @@ perform_cleanup() {
     fi
 
     if [[ "$test_mode_enabled" == "false" && -z "$EXTERNAL_VOLUME_TARGET" ]]; then
-        echo -e "${BLUE}${ICON_ADMIN}${NC} $(detect_architecture) | Free space: $(get_free_space)"
+        if ! initial_free_space_kb=$(get_free_space_kb 2> /dev/null); then
+            initial_free_space_kb=""
+        fi
+        initial_free_space_display=$(format_free_space_kb "$initial_free_space_kb")
+        echo -e "${BLUE}${ICON_ADMIN}${NC} $(detect_architecture) | Free space: $initial_free_space_display"
     fi
 
     if [[ "$test_mode_enabled" == "true" ]]; then
@@ -1235,6 +1242,26 @@ perform_cleanup() {
 
     local -a summary_details=()
 
+    # Emit the "Free space change" (when measurable) and "Free space now" lines.
+    # $1 is the free space in KB captured before cleanup started. Caller appends
+    # each printed line to summary_details.
+    emit_free_space_summary() {
+        local initial_kb="$1"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            printf 'Free space now: %s\n' "$(get_free_space)"
+            return 0
+        fi
+
+        local final_kb
+        if ! final_kb=$(get_free_space_kb 2> /dev/null); then
+            final_kb=""
+        fi
+        if [[ "$initial_kb" =~ ^[0-9]+$ && "$final_kb" =~ ^[0-9]+$ ]]; then
+            printf 'Free space change: %s\n' "$(format_free_space_delta_kb "$((final_kb - initial_kb))")"
+        fi
+        printf 'Free space now: %s\n' "$(format_free_space_kb "$final_kb")"
+    }
+
     if [[ $total_size_cleaned -gt 0 ]]; then
         local freed_size_human
         freed_size_human=$(bytes_to_human_kb "$total_size_cleaned")
@@ -1258,7 +1285,7 @@ perform_cleanup() {
             summary_details+=("Detailed file list: ${GRAY}$EXPORT_LIST_FILE${NC}")
             summary_details+=("Use ${GRAY}mo clean --whitelist${NC} to add protection rules")
         else
-            local summary_line="Space freed: ${GREEN}${freed_size_human}${NC}"
+            local summary_line="Tracked cleanup: ${GREEN}${freed_size_human}${NC}"
 
             if [[ $files_cleaned -gt 0 && $total_items -gt 0 ]]; then
                 summary_line+=" | Items cleaned: $files_cleaned | Categories: $total_items"
@@ -1284,9 +1311,10 @@ perform_cleanup() {
                 fi
             fi
 
-            local final_free_space
-            final_free_space=$(get_free_space)
-            summary_details+=("Free space now: $final_free_space")
+            local free_space_line
+            while IFS= read -r free_space_line; do
+                summary_details+=("$free_space_line")
+            done < <(emit_free_space_summary "$initial_free_space_kb")
         fi
     else
         summary_status="info"
@@ -1295,7 +1323,10 @@ perform_cleanup() {
         else
             summary_details+=("System was already clean; no additional space freed.")
         fi
-        summary_details+=("Free space now: $(get_free_space)")
+        local free_space_line
+        while IFS= read -r free_space_line; do
+            summary_details+=("$free_space_line")
+        done < <(emit_free_space_summary "$initial_free_space_kb")
     fi
 
     if [[ $had_errexit -eq 1 ]]; then
@@ -1376,4 +1407,6 @@ main() {
     exit 0
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
