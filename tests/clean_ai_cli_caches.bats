@@ -111,6 +111,7 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
 safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
 note_activity() { :; }
+compact_codex_sqlite_logs() { :; }
 pgrep() { return 0; }
 clean_codex_cli
 EOF

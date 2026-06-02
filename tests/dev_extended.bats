@@ -368,6 +368,87 @@ EOF
 	[[ "$output" != *"/2.1.102"* ]]
 }
 
+@test "compact_codex_sqlite_logs vacuums reusable space without deleting rows" {
+	command -v sqlite3 >/dev/null 2>&1 || skip "sqlite3 unavailable"
+	rm -rf "$HOME/.codex"
+	mkdir -p "$HOME/.codex"
+	sqlite3 "$HOME/.codex/logs_2.sqlite" <<'SQL'
+CREATE TABLE logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    ts_nanos INTEGER NOT NULL,
+    level TEXT NOT NULL,
+    target TEXT NOT NULL,
+    feedback_log_body TEXT,
+    estimated_bytes INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_logs_ts ON logs(ts DESC, ts_nanos DESC, id DESC);
+WITH RECURSIVE seq(x) AS (
+    SELECT 1
+    UNION ALL
+    SELECT x + 1 FROM seq WHERE x < 200
+)
+INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, estimated_bytes)
+SELECT 1700000000 + x, 0, 'INFO', 'test', randomblob(2048), 2048 FROM seq;
+DELETE FROM logs WHERE id <= 180;
+SQL
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+pgrep() { return 1; }
+compact_codex_sqlite_logs
+sqlite3 "$HOME/.codex/logs_2.sqlite" "SELECT COUNT(*) FROM logs;"
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"Codex logs_2.sqlite compacted"* ]]
+	[[ "$output" == *"20"* ]]
+	rm -rf "$HOME/.codex"
+}
+
+@test "compact_codex_sqlite_logs compacts while Codex is running" {
+	command -v sqlite3 >/dev/null 2>&1 || skip "sqlite3 unavailable"
+	rm -rf "$HOME/.codex"
+	mkdir -p "$HOME/.codex"
+	sqlite3 "$HOME/.codex/logs_2.sqlite" <<'SQL'
+CREATE TABLE logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    ts_nanos INTEGER NOT NULL,
+    level TEXT NOT NULL,
+    target TEXT NOT NULL,
+    feedback_log_body TEXT,
+    estimated_bytes INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_logs_ts ON logs(ts DESC, ts_nanos DESC, id DESC);
+WITH RECURSIVE seq(x) AS (
+    SELECT 1
+    UNION ALL
+    SELECT x + 1 FROM seq WHERE x < 200
+)
+INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, estimated_bytes)
+SELECT 1700000000 + x, 0, 'INFO', 'test', randomblob(2048), 2048 FROM seq;
+DELETE FROM logs WHERE id <= 180;
+SQL
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+pgrep() { return 0; }
+compact_codex_sqlite_logs
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"Codex logs_2.sqlite compacted"* ]]
+	[[ "$output" != *"skipped (Codex running)"* ]]
+	rm -rf "$HOME/.codex"
+}
+
 @test "clean_dev_ai_agents cleans OpenCode disposable logs and runtime artifacts by age" {
     local log_root="$HOME/.local/share/opencode/log"
     local output_root="$HOME/.local/share/opencode/tool-output"
@@ -451,6 +532,47 @@ EOF
     [[ "$output" != *"snapshot-zsh-current.sh"* ]]
     [[ "$output" != *"$HOME/.claude/projects/session.jsonl"* ]]
     [[ "$output" != *"$HOME/.claude/history.jsonl"* ]]
+}
+
+@test "clean_dev_ai_agents cleans Pi disposable artifacts without session transcripts" {
+    local pi_agent="$HOME/.pi/agent"
+    local pi_sessions="$pi_agent/sessions/--test-project--"
+    local pi_artifacts="$pi_sessions/subagent-artifacts"
+    local pi_tmp="${TMPDIR:-/tmp}/pi-subagents-mole-test"
+    mkdir -p "$pi_agent/bin" "$pi_artifacts" "$pi_tmp/artifacts" "$pi_tmp/chain-runs"
+    touch "$pi_agent/pi-debug.log"
+    touch -t 202001010000 "$pi_agent/legacy-session.jsonl"
+    touch "$pi_sessions/current-session.jsonl"
+    touch -t 202001010000 "$pi_artifacts/old-run_output.md"
+    touch "$pi_artifacts/current-run_output.md"
+    touch -t 202001010000 "$pi_tmp/artifacts/stale.md"
+    touch "$pi_tmp/artifacts/current.md"
+    mkdir -p "$pi_tmp/chain-runs"
+    touch -t 202001010000 "$pi_tmp/chain-runs/old-chain"
+    touch "$pi_agent/auth.json" "$pi_agent/run-history.jsonl"
+
+    run env HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+safe_clean() { echo "$1|$2"; }
+MOLE_AI_AGENT_RETENTION_DAYS=14 clean_dev_ai_agents
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"$pi_agent/pi-debug.log|Pi debug log"* ]]
+    [[ "$output" == *"$pi_agent/legacy-session.jsonl|Pi misplaced session file"* ]]
+    [[ "$output" != *"current-session.jsonl"* ]]
+    [[ "$output" == *"$pi_artifacts/old-run_output.md|Pi subagent artifacts"* ]]
+    [[ "$output" != *"current-run_output.md"* ]]
+    [[ "$output" == *"$pi_tmp/artifacts/stale.md|Pi subagent temp artifacts"* ]]
+    [[ "$output" != *"$pi_tmp/artifacts/current.md"* ]]
+    [[ "$output" == *"$pi_tmp/chain-runs/old-chain|Pi subagent chain temp"* ]]
+    [[ "$output" != *"auth.json"* ]]
+    [[ "$output" != *"run-history.jsonl"* ]]
+
+    rm -rf "$pi_agent" "$pi_tmp"
 }
 
 @test "clean_dev_jetbrains_logs only targets JetBrains logs" {

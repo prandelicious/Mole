@@ -1455,6 +1455,27 @@ clean_dev_ai_agents() {
     safe_clean "$HOME/.claude/statsig"/statsig.failed_logs.* "Claude Code failed telemetry logs"
     clean_ai_agent_old_entries "$HOME/.claude/shell-snapshots" "Claude Code old shell snapshots" "$retention_days" "snapshot-*"
 
+    # Pi: keep auth, settings, session transcripts under sessions/, extensions,
+    # skills, npm/git installs, run-history, and extension state (pi-goal, etc.).
+    local pi_agent="$HOME/.pi/agent"
+    if [[ -d "$pi_agent" ]]; then
+        safe_clean "$pi_agent/pi-debug.log" "Pi debug log"
+        # v0.30.0 misplaced session JSONL at agent root; real transcripts live under sessions/.
+        clean_ai_agent_old_entries "$pi_agent" "Pi misplaced session file" "$((retention_days * 2))" "*.jsonl"
+        clean_ai_agent_old_entries "$pi_agent/bin" "Pi binary extract temp" "$retention_days" "extract_tmp_*"
+        local pi_artifacts_dir
+        while IFS= read -r -d '' pi_artifacts_dir; do
+            clean_ai_agent_old_entries "$pi_artifacts_dir" "Pi subagent artifacts" "$retention_days"
+        done < <(command find "$pi_agent/sessions" -type d -name subagent-artifacts -print0 2> /dev/null)
+        local pi_tmp_root="${TMPDIR:-/tmp}"
+        local pi_tmp_dir
+        while IFS= read -r -d '' pi_tmp_dir; do
+            clean_ai_agent_old_entries "$pi_tmp_dir/artifacts" "Pi subagent temp artifacts" "$retention_days"
+            clean_ai_agent_old_entries "$pi_tmp_dir/chain-runs" "Pi subagent chain temp" "$retention_days"
+            clean_ai_agent_old_entries "$pi_tmp_dir/async-subagent-runs" "Pi subagent async temp" "$retention_days"
+        done < <(command find "$pi_tmp_root" -mindepth 1 -maxdepth 1 -type d -name 'pi-subagents-*' -print0 2> /dev/null)
+    fi
+
     # Other coding-agent caches with clearly disposable cache/temp boundaries.
     safe_clean "$HOME/.cache/aider"/* "Aider cache"
     safe_clean "$HOME/.cache/gemini-cli"/* "Gemini CLI cache"
@@ -1628,11 +1649,96 @@ clean_codex_runtimes() {
     done < <(command find "$runtime_root" -mindepth 1 -maxdepth 1 -type d -print0 2> /dev/null)
 }
 
+# Reclaim free pages in Codex SQLite databases under ~/.codex/*.sqlite.
+# Runs even when Codex is active; a locked database reports compaction failed.
+_compact_codex_sqlite_db() {
+    local db_file="$1"
+    [[ -f "$db_file" ]] || return 0
+
+    local db_label
+    db_label="$(basename "$db_file")"
+
+    if ! command -v sqlite3 > /dev/null 2>&1; then
+        debug_log "Skipping Codex $db_label compaction: sqlite3 unavailable"
+        return 0
+    fi
+
+    case "$(file -b "$db_file" 2> /dev/null || true)" in
+        *SQLite*) ;;
+        *) return 0 ;;
+    esac
+
+    local page_info=""
+    page_info=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" sqlite3 "$db_file" "PRAGMA page_count; PRAGMA freelist_count;" 2> /dev/null || echo "")
+
+    local page_count=""
+    local freelist_count=""
+    page_count="${page_info%%$'\n'*}"
+    if [[ "$page_info" == *$'\n'* ]]; then
+        freelist_count="${page_info#*$'\n'}"
+        freelist_count="${freelist_count%%$'\n'*}"
+    fi
+
+    if [[ ! "$page_count" =~ ^[0-9]+$ || ! "$freelist_count" =~ ^[0-9]+$ || "$page_count" -eq 0 ]]; then
+        debug_log "Skipping Codex $db_label compaction: page stats unavailable"
+        return 0
+    fi
+
+    # Leave already compact databases alone.
+    if ((freelist_count * 100 < page_count * 5)); then
+        return 0
+    fi
+
+    if [[ "${DRY_RUN:-false}" == "true" || "${MOLE_DRY_RUN:-0}" == "1" ]]; then
+        echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Codex $db_label · would compact"
+        note_activity
+        return 0
+    fi
+
+    local integrity_check=""
+    set +e
+    integrity_check=$(run_with_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" sqlite3 "$db_file" "PRAGMA integrity_check;" 2> /dev/null)
+    local integrity_status=$?
+    set -e
+
+    if [[ $integrity_status -ne 0 || "$integrity_check" != "ok" ]]; then
+        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Codex $db_label · skipped (integrity check failed)"
+        note_activity
+        return 0
+    fi
+
+    set +e
+    run_with_timeout "$MOLE_TIMEOUT_DISK_VERIFY_SEC" sqlite3 "$db_file" "VACUUM;" > /dev/null 2>&1
+    local vacuum_status=$?
+    set -e
+
+    if [[ $vacuum_status -eq 0 ]]; then
+        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Codex $db_label compacted"
+    elif [[ $vacuum_status -eq 124 ]]; then
+        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Codex $db_label · compaction timed out"
+    else
+        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Codex $db_label · compaction failed"
+    fi
+    note_activity
+}
+
+compact_codex_sqlite_logs() {
+    local codex_root="$HOME/.codex"
+    [[ -d "$codex_root" ]] || return 0
+
+    local db_file
+    for db_file in "$codex_root"/*.sqlite; do
+        _compact_codex_sqlite_db "$db_file"
+    done
+}
+
 # Codex CLI and Desktop share state under ~/.codex. Keep it out of default
 # cleanup so app indexes, sessions, credentials, and local thread state survive.
 clean_codex_cli() {
     local codex_root="$HOME/.codex"
     [[ -d "$codex_root" ]] || return 0
+
+    compact_codex_sqlite_logs
 
     if codex_running; then
         echo -e "  ${GRAY}${ICON_WARNING}${NC} Codex CLI state · skipped (Codex running)"
