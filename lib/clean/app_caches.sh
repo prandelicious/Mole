@@ -164,6 +164,7 @@ clean_code_editors() {
     safe_clean ~/Library/Application\ Support/Code/Cache/* "VS Code cache"
     safe_clean ~/Library/Application\ Support/Code/CachedExtensions/* "VS Code extension cache"
     safe_clean ~/Library/Application\ Support/Code/CachedData/* "VS Code data cache"
+    safe_clean ~/Library/Application\ Support/Code/WebStorage/*/CacheStorage/* "VS Code webview cache"
     safe_clean ~/Library/Caches/com.sublimetext.*/* "Sublime Text cache"
     safe_clean ~/Library/Caches/Zed/* "Zed cache"
     safe_clean ~/Library/Logs/Zed/* "Zed logs"
@@ -199,6 +200,7 @@ clean_communication_apps() {
     safe_clean ~/Library/Caches/com.skype.skype/* "Skype cache"
     safe_clean ~/Library/Caches/com.tencent.meeting/* "Tencent Meeting cache"
     safe_clean ~/Library/Caches/com.tencent.WeWorkMac/* "WeCom cache"
+    safe_clean ~/Library/Caches/com.tencent.qq/* "QQ cache"
     safe_clean ~/Library/Caches/com.feishu.*/* "Feishu cache"
     if [[ -d ~/Library/Application\ Support/Microsoft/Teams ]]; then
         safe_clean ~/Library/Application\ Support/Microsoft/Teams/Cache/* "Microsoft Teams legacy cache"
@@ -223,6 +225,7 @@ clean_ai_apps() {
     safe_clean ~/Library/Caches/com.openai.chat/* "ChatGPT cache"
     safe_clean ~/Library/Caches/com.anthropic.claudefordesktop/* "Claude desktop cache"
     safe_clean ~/Library/Logs/Claude/* "Claude logs"
+    safe_clean ~/Library/Caches/com.lmstudio.lmstudio/* "LM Studio cache"
     if [[ -d "$HOME/Library/Application Support/Codex" || -d "$HOME/Library/Logs/com.openai.codex" ]]; then
         echo -e "  ${GRAY}${ICON_WARNING}${NC} Codex Desktop state · skipped by default"
         note_activity
@@ -370,6 +373,7 @@ clean_productivity_apps() {
     safe_clean ~/Library/Containers/com.ideasoncanvas.mindnode/Data/Library/Caches/* "MindNode cache"
     safe_clean ~/.cache/kaku/* "Kaku cache"
     safe_clean ~/Library/Application\ Support/spacedrive/thumbnails/* "Spacedrive thumbnail cache"
+    safe_clean ~/Library/Containers/is.follow/Data/Library/Application\ Support/Folo/Cache/Cache_Data/* "Folo cache"
 }
 # Music/media players (protect Spotify offline music).
 clean_media_players() {
@@ -432,6 +436,7 @@ clean_video_players() {
     safe_clean ~/Library/Caches/tv.danmaku.bili/* "Bilibili cache"
     safe_clean ~/Library/Caches/com.douyu.*/* "Douyu cache"
     safe_clean ~/Library/Caches/com.huya.*/* "Huya cache"
+    safe_clean ~/Library/Containers/com.wuziqi.SenPlayer/Data/tmp/videoCache/* "SenPlayer video cache"
     safe_clean ~/Library/Caches/smart.stremio*/* "Stremio cache"
     if [[ -d ~/Library/Application\ Support/stremio ]]; then
         safe_clean ~/Library/Application\ Support/stremio/stremio-server/stremio-cache/* "Stremio server cache"
@@ -620,9 +625,6 @@ clean_note_apps() {
 clean_launcher_apps() {
     safe_clean ~/Library/Caches/com.runningwithcrayons.Alfred/* "Alfred cache"
     safe_clean ~/Library/Caches/cx.c3.theunarchiver/* "The Unarchiver cache"
-    # Raycast: only clean network and FS caches; Clipboard subfolder contains user's clipboard history.
-    safe_clean ~/Library/Caches/com.raycast.macos/urlcache/* "Raycast URL cache"
-    safe_clean ~/Library/Caches/com.raycast.macos/fsCachedData/* "Raycast FS cache"
 }
 # Remote desktop tools.
 clean_remote_desktop() {

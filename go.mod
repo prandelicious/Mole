@@ -6,8 +6,8 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
-	github.com/shirou/gopsutil/v4 v4.26.4
-	golang.org/x/sync v0.20.0
+	github.com/shirou/gopsutil/v4 v4.26.5
+	golang.org/x/sync v0.21.0
 )
 
 require (

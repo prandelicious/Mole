@@ -525,15 +525,31 @@ clean_orphaned_system_services() {
         return 1
     }
 
+    # Read a launchd program path from a system plist.
+    # The plist itself was discovered with sudo, so read it with sudo too (the
+    # caller already cleared a `sudo -n true` probe, so keep it non-interactive):
+    # unreadable root-owned plists make PlistBuddy print a non-path "File Doesn't
+    # Exist, Will Create..." message on stdout, which must never be treated as a
+    # missing binary path.
+    _plist_program_value() {
+        local plist="$1"
+        local key="$2"
+        local value=""
+        value=$(sudo -n /usr/libexec/PlistBuddy -c "Print :$key" "$plist" 2> /dev/null || true)
+
+        [[ -z "$value" ]] && return 1
+        [[ "$value" != /* ]] && return 1
+
+        printf '%s\n' "$value"
+    }
+
     # Read the program binary from a plist (Program or ProgramArguments[0]).
-    # Prints the path; returns 1 if no Program key found.
+    # Prints the path; returns 1 if no usable absolute Program key found.
     _plist_binary_path() {
         local plist="$1"
         local binary=""
-        binary=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$plist" 2> /dev/null || true)
-        if [[ -z "$binary" ]]; then
-            binary=$(/usr/libexec/PlistBuddy -c "Print :Program" "$plist" 2> /dev/null || true)
-        fi
+        binary=$(_plist_program_value "$plist" "ProgramArguments:0" || true)
+        [[ -z "$binary" ]] && binary=$(_plist_program_value "$plist" "Program" || true)
         [[ -z "$binary" ]] && return 1
         printf '%s\n' "$binary"
     }
@@ -567,8 +583,22 @@ clean_orphaned_system_services() {
         local binary
         binary=$(_plist_binary_path "$plist") || return 1 # no Program key → skip
 
-        # If the binary still exists, the service is healthy.
-        [[ -e "$binary" ]] && return 1
+        # If the binary still exists, check if it's in PrivilegedHelperTools.
+        # If so, verify the parent app is still installed. If the parent app
+        # is gone, the binary itself is orphaned, so this plist is too. See #1082.
+        if [[ -e "$binary" ]]; then
+            if [[ "$binary" == /Library/PrivilegedHelperTools/* ]]; then
+                local helper_bundle_id
+                helper_bundle_id=$(basename "$binary")
+                helper_bundle_id="${helper_bundle_id%.plist}"
+                if bundle_has_installed_app "$helper_bundle_id"; then
+                    return 1 # Parent app still installed, plist is healthy
+                fi
+                # Parent app is gone, binary is orphaned, so plist is orphaned
+                return 0
+            fi
+            return 1 # Binary exists and not in PrivilegedHelperTools, plist is healthy
+        fi
 
         # If the binary is in a package-manager / system path, skip.
         _is_package_managed_binary "$binary" && return 1
@@ -605,7 +635,7 @@ clean_orphaned_system_services() {
                 orphaned_files+=("$plist")
                 orphaned_count=$((orphaned_count + 1))
             fi
-        done < <(sudo find /Library/LaunchDaemons -maxdepth 1 -name "*.plist" -print0 2> /dev/null)
+        done < <(sudo -n find /Library/LaunchDaemons -maxdepth 1 -name "*.plist" -print0 2> /dev/null)
     fi
 
     # Scan system LaunchAgents
@@ -624,7 +654,7 @@ clean_orphaned_system_services() {
                 orphaned_files+=("$plist")
                 orphaned_count=$((orphaned_count + 1))
             fi
-        done < <(sudo find /Library/LaunchAgents -maxdepth 1 -name "*.plist" -print0 2> /dev/null)
+        done < <(sudo -n find /Library/LaunchAgents -maxdepth 1 -name "*.plist" -print0 2> /dev/null)
     fi
 
     # Scan PrivilegedHelperTools
@@ -676,7 +706,7 @@ clean_orphaned_system_services() {
                     orphaned_count=$((orphaned_count + 1))
                 fi
             fi
-        done < <(sudo find /Library/PrivilegedHelperTools -maxdepth 1 -type f -print0 2> /dev/null)
+        done < <(sudo -n find /Library/PrivilegedHelperTools -maxdepth 1 -type f -print0 2> /dev/null)
     fi
 
     stop_section_spinner
@@ -705,7 +735,12 @@ clean_orphaned_system_services() {
         local removed_kb=0
 
         for orphan_file in "${orphaned_files[@]}"; do
-            if should_protect_path "$orphan_file"; then
+            # Orphans were already verified to have no installed parent app, so
+            # bypass the data-protection filename check (which would otherwise block
+            # legitimately orphaned files like Docker helpers) for this single call.
+            # MOLE_UNINSTALL_MODE is scoped to the call and never leaks to later
+            # cleanup sections; SYSTEM_CRITICAL_BUNDLES stay protected. See #1082.
+            if MOLE_UNINSTALL_MODE=1 should_protect_path "$orphan_file"; then
                 debug_log "Skipping protected orphaned service: $orphan_file"
                 skipped_protected_count=$((skipped_protected_count + 1))
                 continue
@@ -714,11 +749,11 @@ clean_orphaned_system_services() {
                 debug_log "[DRY RUN] Would remove orphaned service: $orphan_file"
             else
                 local file_size_kb
-                file_size_kb=$(sudo du -skP "$orphan_file" 2> /dev/null | awk '{print $1}' || echo "0")
+                file_size_kb=$(sudo -n du -skP "$orphan_file" 2> /dev/null | awk '{print $1}' || echo "0")
 
                 # Unload if it's a LaunchDaemon/LaunchAgent
                 if [[ "$orphan_file" == *.plist ]]; then
-                    sudo launchctl unload "$orphan_file" 2> /dev/null || true
+                    sudo -n launchctl unload "$orphan_file" 2> /dev/null || true
                 fi
                 if safe_sudo_remove "$orphan_file"; then
                     debug_log "Removed orphaned service: $orphan_file"

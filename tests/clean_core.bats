@@ -116,6 +116,104 @@ MOCK
     [[ "$output" == *"full preview"* ]]
 }
 
+@test "mo clean adopts cached sudo before system cleanup (#1084)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+TRACE="$HOME/sudo-adopt.log"
+> "$TRACE"
+
+source "$PROJECT_ROOT/bin/clean.sh"
+
+DRY_RUN=false
+EXTERNAL_VOLUME_TARGET=""
+
+sudo() {
+    printf 'sudo %s\n' "$*" >> "$TRACE"
+    [[ "${1:-}" == "-n" && "${2:-}" == "-v" ]]
+}
+_start_sudo_keepalive() {
+    printf 'keepalive\n' >> "$TRACE"
+    echo "keepalive-pid"
+}
+_stop_sudo_keepalive() { :; }
+
+start_cleanup
+cat "$TRACE"
+printf 'SYSTEM_CLEAN=%s\n' "$SYSTEM_CLEAN"
+printf 'MOLE_SUDO_ESTABLISHED=%s\n' "$MOLE_SUDO_ESTABLISHED"
+printf 'MOLE_SUDO_KEEPALIVE_PID=%s\n' "$MOLE_SUDO_KEEPALIVE_PID"
+SCRIPT
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"sudo -n -v"* ]]
+    [[ "$output" == *"keepalive"* ]]
+    [[ "$output" == *"SYSTEM_CLEAN=true"* ]]
+    [[ "$output" == *"MOLE_SUDO_ESTABLISHED=true"* ]]
+    [[ "$output" == *"MOLE_SUDO_KEEPALIVE_PID=keepalive-pid"* ]]
+}
+
+@test "mo clean sudo prompt preserves a directly typed password (#1059)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+        bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+
+ensure_sudo_session() {
+    echo "ENSURE_PLAIN"
+    return 0
+}
+ensure_sudo_session_with_password() {
+    echo "ENSURE_PASSWORD=$1"
+    [[ "$1" == "secret" ]]
+}
+drain_pending_input() { :; }
+# A user who expects a password prompt may start typing immediately. The first
+# printable key and the rest of the line must reach authentication together.
+read_key() {
+    echo "CHAR:s"
+}
+read_clean_sudo_password_remainder() {
+    printf -v "$1" '%s' "ecret"
+}
+
+prompt_for_system_clean
+printf '\nSYSTEM_CLEAN=%s\n' "$SYSTEM_CLEAN"
+SCRIPT
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"continue"* ]]
+    [[ "$output" != *"Enter"*"password"* ]]
+    [[ "$output" == *"ENSURE_PASSWORD=secret"* ]]
+    [[ "$output" != *"ENSURE_PLAIN"* ]]
+    [[ "$output" == *"SYSTEM_CLEAN=true"* ]]
+    [[ "$output" != *"Skipped"* ]]
+}
+
+@test "mo clean sudo prompt still skips on explicit Space (#1059)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+        bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+
+ensure_sudo_session() {
+    echo "ENSURE_SUDO"
+    return 0
+}
+drain_pending_input() { :; }
+read_key() {
+    echo "SPACE"
+}
+
+prompt_for_system_clean
+printf '\nSYSTEM_CLEAN=%s\n' "$SYSTEM_CLEAN"
+SCRIPT
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Skipped"* ]]
+    [[ "$output" != *"ENSURE_SUDO"* ]]
+    [[ "$output" == *"SYSTEM_CLEAN=false"* ]]
+}
+
 @test "cloud and office timeout path uses helper function instead of bash -c" {
     run bash -c "grep -Eq 'run_with_shell_timeout 300 run_cloud_and_office_cleanup' '$PROJECT_ROOT/bin/clean.sh'"
     [ "$status" -eq 0 ]
@@ -179,6 +277,7 @@ clean_application_support_logs() { :; }
 clean_orphaned_app_data() { :; }
 clean_orphaned_system_services() { :; }
 clean_orphaned_container_stubs() { :; }
+clean_stale_launch_services_registrations() { :; }
 show_user_launch_agent_hint_notice() { :; }
 show_orphan_dotdir_hint_notice() { :; }
 clean_apple_silicon_caches() { :; }

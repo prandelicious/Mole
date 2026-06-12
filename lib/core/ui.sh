@@ -207,6 +207,7 @@ read_key() {
                 fi
                 ;;
             ' ') echo "SPACE" ;; # Allow space in filter mode for selection
+            $'\x03') echo "QUIT" ;;
             [[:print:]]) echo "CHAR:$key" ;;
             *) echo "OTHER" ;;
         esac
@@ -406,9 +407,7 @@ stop_inline_spinner() {
 
 # Get spinner characters
 mo_spinner_chars() {
-    local chars="|/-\\"
-    [[ -z "$chars" ]] && chars="|/-\\"
-    printf "%s" "$chars"
+    printf "%s" "|/-\\"
 }
 
 # Format relative time for compact display (e.g., 3d ago)

@@ -596,12 +596,12 @@ func TestColorizeTemp(t *testing.T) {
 	}{
 		{"very low", 20.0},
 		{"low", 40.0},
-		{"normal threshold", 55.9},
-		{"at warn threshold", 56.0},
-		{"warn range", 65.0},
-		{"just below danger", 75.9},
-		{"at danger threshold", 76.0},
-		{"high", 85.0},
+		{"normal range", 55.0},
+		{"at warn threshold", 65.0},
+		{"warn range", 75.0},
+		{"just below danger", 84.9},
+		{"at danger threshold", 85.0},
+		{"high", 92.0},
 		{"very high", 95.0},
 	}
 
@@ -968,7 +968,7 @@ func TestRenderHeaderErrorReturnsMoleOnce(t *testing.T) {
 
 func TestStatusDiagnosisLineUsesTopCPUProcess(t *testing.T) {
 	m := MetricsSnapshot{
-		CPU: CPUStatus{Usage: 78},
+		CPU: CPUStatus{Usage: 95},
 		TopProcesses: []ProcessInfo{
 			{Name: "Safari", CPU: 12},
 			{Name: "Xcode", CPU: 82},
@@ -1015,19 +1015,30 @@ func TestStatusDiagnosisLineFallsBackToAllClear(t *testing.T) {
 
 func TestRenderProcessCardAddsInlineHintWithoutExtraRows(t *testing.T) {
 	card := renderProcessCard([]ProcessInfo{
-		{Name: "Chrome", CPU: 12, Memory: 22},
-		{Name: "Xcode", CPU: 82, Memory: 8},
+		{Name: "Chrome", CPU: 12, Memory: 22, MemoryBytes: 2 * 1024 * 1024 * 1024},
+		{Name: "Xcode", CPU: 95, Memory: 8, MemoryBytes: 512 * 1024 * 1024},
 	})
 
 	if len(card.lines) != 2 {
 		t.Fatalf("renderProcessCard() lines = %d, want 2", len(card.lines))
 	}
 	plain := stripANSI(strings.Join(card.lines, "\n"))
-	if !strings.Contains(plain, "M22%") {
-		t.Fatalf("renderProcessCard() missing memory hint, got %q", plain)
+	if !strings.Contains(plain, "2.0G") {
+		t.Fatalf("renderProcessCard() missing resident memory hint, got %q", plain)
 	}
 	if !strings.Contains(plain, "hot") {
 		t.Fatalf("renderProcessCard() missing cpu hint, got %q", plain)
+	}
+}
+
+func TestRenderProcessCardFallsBackToMemoryPercent(t *testing.T) {
+	card := renderProcessCard([]ProcessInfo{
+		{Name: "Chrome", CPU: 12, Memory: 22},
+	})
+
+	plain := stripANSI(strings.Join(card.lines, "\n"))
+	if !strings.Contains(plain, "M22%") {
+		t.Fatalf("renderProcessCard() missing memory percent fallback, got %q", plain)
 	}
 }
 

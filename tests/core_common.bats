@@ -383,6 +383,16 @@ EOF
     done
 }
 
+@test "should_protect_data covers Raycast wildcard variants" {
+    for id in com.raycast.macos com.raycast.shared com.raycast.macos.BrowserExtension; do
+        result=$(HOME="$HOME" bash --noprofile --norc -c "source '$PROJECT_ROOT/lib/core/common.sh'; should_protect_data '$id' && echo 'protected' || echo 'not-protected'")
+        [ "$result" = "protected" ]
+    done
+
+    result=$(HOME="$HOME" bash --noprofile --norc -c "source '$PROJECT_ROOT/lib/core/common.sh'; should_protect_data 'com.raycastfoo.bar' && echo 'protected' || echo 'not-protected'")
+    [ "$result" = "not-protected" ]
+}
+
 @test "should_protect_path protects NetworkExtension VPN preferences" {
     result=$(HOME="$HOME" bash --noprofile --norc -c "source '$PROJECT_ROOT/lib/core/common.sh'; should_protect_path '/Volumes/Data/Library/Preferences/com.apple.networkextension.plist' && echo 'protected' || echo 'not-protected'")
     [ "$result" = "protected" ]
@@ -502,6 +512,11 @@ EOF
     [ "$output" = "CHAR:j" ]
 }
 
+@test "read_key keeps Ctrl-C as quit when forcing printable characters" {
+    run bash -c "export MOLE_BASE_LOADED=1; export MOLE_READ_KEY_FORCE_CHAR=1; source '$PROJECT_ROOT/lib/core/ui.sh'; printf '\\003' | read_key"
+    [ "$output" = "QUIT" ]
+}
+
 @test "ensure_sudo_session returns 1 and sets MOLE_SUDO_ESTABLISHED=false in test mode" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 bash --noprofile --norc <<'SCRIPT'
 source "$PROJECT_ROOT/lib/core/base.sh"
@@ -557,4 +572,32 @@ SCRIPT
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"EXIT=0"* ]]
+}
+
+@test "adopt_sudo_session starts keepalive for cached sudo" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/base.sh"
+source "$PROJECT_ROOT/lib/core/sudo.sh"
+
+sudo() {
+    printf 'SUDO:%s\n' "$*"
+    [[ "${1:-}" == "-n" && "${2:-}" == "-v" ]]
+}
+_start_sudo_keepalive() {
+    echo "keepalive-pid"
+}
+_stop_sudo_keepalive() { :; }
+
+adopt_sudo_session
+echo "EXIT=$?"
+echo "FLAG=$MOLE_SUDO_ESTABLISHED"
+echo "PID=$MOLE_SUDO_KEEPALIVE_PID"
+SCRIPT
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SUDO:-n -v"* ]]
+    [[ "$output" == *"EXIT=0"* ]]
+    [[ "$output" == *"FLAG=true"* ]]
+    [[ "$output" == *"PID=keepalive-pid"* ]]
 }
