@@ -956,6 +956,64 @@ EOF
     [[ "$output" == *"Orphaned app container stubs"* ]]
 }
 
+@test "clean_orphaned_container_stubs preserves content that appears during removal" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+
+stub="$HOME/Library/Containers/com.macpaw.CleanMyMac-mas"
+mkdir -p "$stub"
+touch "$stub/.com.apple.containermanagerd.metadata.plist"
+
+fake_bin="$(mktemp -d "$HOME/fake-bin.XXXXXX")"
+cat > "$fake_bin/rm" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+target=""
+for arg in "$@"; do
+    target="$arg"
+done
+if [[ -n "$target" ]]; then
+    if [[ -d "$target" ]]; then
+        touch "$target/raced-content"
+    else
+        parent=$(dirname "$target")
+        touch "$parent/raced-content"
+    fi
+fi
+exec /bin/rm "$@"
+SH
+chmod +x "$fake_bin/rm"
+PATH="$fake_bin:$PATH"
+export PATH
+hash -r
+
+mdfind() { echo ""; return 0; }
+run_with_timeout() { shift; "$@"; }
+note_activity() { :; }
+debug_log() { :; }
+is_path_whitelisted() { return 1; }
+
+files_cleaned=0
+total_items=0
+total_size_cleaned=0
+
+clean_orphaned_container_stubs
+
+if [[ -f "$stub/raced-content" ]]; then
+    echo "PASS: race content preserved"
+else
+    echo "FAIL: race content was deleted"
+    exit 1
+fi
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"PASS: race content preserved"* ]]
+    [[ "$output" == *"could not be removed"* ]]
+}
+
 @test "clean_orphaned_container_stubs preserves container when app is installed" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -1062,4 +1120,55 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"PASS: non-stub container preserved"* ]]
+}
+
+@test "clean_orphaned_system_services tolerates all-whitelisted orphans on /bin/bash 3.2 (#1127)" {
+    # macOS ships /bin/bash 3.2 (Apple does not upgrade past it, GPLv3) and
+    # lib/clean/apps.sh runs under `set -u`, where bash 3.2 treats "${empty[@]}"
+    # as an unbound variable rather than an empty expansion. When orphans are
+    # found but every one is whitelisted, kept_files ends up empty and the
+    # whitelist filter's `orphaned_files=("${kept_files[@]}")` aborted the whole
+    # clean run with "kept_files[@]: unbound variable". Force /bin/bash so the
+    # 3.2 expansion behaviour is exercised regardless of any newer bash on PATH.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 DRY_RUN=true /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+debug_log() { :; }
+
+should_protect_path() { return 1; }
+# Every detected orphan is whitelisted, so kept_files stays empty.
+is_path_whitelisted() { return 0; }
+WHITELIST_PATTERNS=("com.example.*")
+
+tmp_dir="$(mktemp -d)"
+tmp_plist="$tmp_dir/com.example.whitelisted.orphan.plist"
+/usr/libexec/PlistBuddy -c "Add :Program string $tmp_dir/missing-binary" "$tmp_plist" 2> /dev/null || true
+
+sudo() {
+  if [[ "$1" == "-n" && "$2" == "true" ]]; then
+    return 0
+  fi
+  [[ "${1:-}" == "-n" ]] && shift
+  if [[ "$1" == "find" ]]; then
+    case "$2" in
+      /Library/LaunchDaemons) printf '%s\0' "$tmp_plist" ;;
+      *) : ;;
+    esac
+    return 0
+  fi
+  command "$@"
+}
+
+clean_orphaned_system_services
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"unbound variable"* ]] || return 1
+    # Whitelisted orphan must be filtered out, so nothing is reported for removal.
+    [[ "$output" != *"Would remove orphaned service"* ]] || return 1
 }
