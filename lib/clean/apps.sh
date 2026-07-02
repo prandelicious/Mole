@@ -426,6 +426,27 @@ clean_orphaned_app_data() {
     rm -f "$installed_bundles"
 }
 
+_privileged_helper_bundle_id_from_binary() {
+    local binary="$1"
+    local helper_bundle_id=""
+
+    case "$binary" in
+        /Library/PrivilegedHelperTools/*.bundle/Contents/MacOS/*)
+            local helper_bundle_dir info_plist
+            helper_bundle_dir="${binary%/Contents/MacOS/*}"
+            info_plist="$helper_bundle_dir/Contents/Info.plist"
+            helper_bundle_id=$(plutil -extract CFBundleIdentifier raw "$info_plist" 2> /dev/null || true)
+            [[ -n "$helper_bundle_id" ]] || helper_bundle_id=$(basename "$helper_bundle_dir" .bundle)
+            ;;
+        *)
+            helper_bundle_id=$(basename "$binary")
+            helper_bundle_id="${helper_bundle_id%.plist}"
+            ;;
+    esac
+
+    printf '%s\n' "$helper_bundle_id"
+}
+
 # Clean orphaned system-level services (LaunchDaemons, LaunchAgents, PrivilegedHelperTools)
 # These are left behind when apps are uninstalled but their system services remain
 clean_orphaned_system_services() {
@@ -589,8 +610,7 @@ clean_orphaned_system_services() {
         if [[ -e "$binary" ]]; then
             if [[ "$binary" == /Library/PrivilegedHelperTools/* ]]; then
                 local helper_bundle_id
-                helper_bundle_id=$(basename "$binary")
-                helper_bundle_id="${helper_bundle_id%.plist}"
+                helper_bundle_id=$(_privileged_helper_bundle_id_from_binary "$binary")
                 if bundle_has_installed_app "$helper_bundle_id"; then
                     return 1 # Parent app still installed, plist is healthy
                 fi
@@ -763,10 +783,15 @@ clean_orphaned_system_services() {
                 if [[ "$orphan_file" == *.plist ]]; then
                     sudo -n launchctl unload "$orphan_file" 2> /dev/null || true
                 fi
-                if safe_sudo_remove "$orphan_file"; then
+                local remove_rc=0
+                safe_sudo_remove "$orphan_file" || remove_rc=$?
+                if [[ $remove_rc -eq 0 ]]; then
                     debug_log "Removed orphaned service: $orphan_file"
                     removed_count=$((removed_count + 1))
                     removed_kb=$((removed_kb + file_size_kb))
+                elif [[ $remove_rc -eq $MOLE_ERR_PROTECTED_PATH ]]; then
+                    debug_log "Skipping protected orphaned service: $orphan_file"
+                    skipped_protected_count=$((skipped_protected_count + 1))
                 else
                     debug_log "Failed to remove orphaned service: $orphan_file"
                     failed_count=$((failed_count + 1))

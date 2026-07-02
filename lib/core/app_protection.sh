@@ -216,6 +216,35 @@ should_protect_data() {
     return 1
 }
 
+# Endpoint security / EDR / MDM agents (CrowdStrike Falcon, SentinelOne, ESET,
+# Jamf, GlobalProtect, Cisco Secure Client) tamper-protect their on-disk state.
+# Deleting anything that belongs to them under the per-user Darwin folder -- a
+# rebuildable Metal/GPU shader cache (.../C/...), a code-signature clone
+# (.../X/<bundle-id>.code_sign_clone), or temp (.../T/...) -- trips sensor tamper
+# detection (e.g. CrowdStrike "MacFalconSensorTamper", MITRE T1562.001) that
+# corporate security reports as malware. Reclaim is only a few MB, so never touch
+# these. The vendor prefixes live in ENDPOINT_SECURITY_BUNDLE_PREFIXES
+# (app_protection_data.sh); matching a vendor id anywhere under var/folders is
+# protection-only, so a wide match is safe. Shared by should_protect_path() and
+# the cache/clone sweeps in lib/clean/system.sh and lib/clean/user.sh.
+is_endpoint_security_cache_path() {
+    local path="$1"
+    # Fast reject: only the per-user Darwin folders are in scope (the real
+    # /private/var/folders and its /var/folders symlink form). Anchored to the
+    # absolute root so an unrelated ".../var/folders/..." path cannot match.
+    case "$path" in
+        /private/var/folders/* | /var/folders/*) ;;
+        *) return 1 ;;
+    esac
+    local prefix
+    for prefix in "${ENDPOINT_SECURITY_BUNDLE_PREFIXES[@]}"; do
+        case "$path" in
+            *"$prefix"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 # Check if a path is protected from deletion
 # Centralized logic to protect system settings, control center, and critical apps
 #
@@ -292,6 +321,13 @@ should_protect_path() {
             return 0
             ;;
     esac
+
+    # 4b. Endpoint security / EDR agent caches (CrowdStrike Falcon, SentinelOne,
+    # etc.). Dedicated predicate so the same vendor list is reused by the
+    # GPU-cache sweep in lib/clean/system.sh and matches deterministically.
+    if is_endpoint_security_cache_path "$path"; then
+        return 0
+    fi
 
     # 5. Protect critical preference files and user data
     case "$path" in
@@ -648,10 +684,54 @@ _path_belongs_to_independent_cli() {
     return 1
 }
 
+_mole_uninstall_embedded_bundle_ids() {
+    local app_path="${1:-}"
+    local primary_bundle_id="${2:-}"
+    local max_info_plists=128
+    local scanned=0
+
+    [[ -n "$app_path" && -d "$app_path/Contents" ]] || return 0
+    [[ "$app_path" == /* && "$app_path" != *$'\n'* && "$app_path" != *"/.."* ]] || return 0
+
+    local info bundle_root bundle_name ext embedded_id
+    while IFS= read -r -d '' info; do
+        scanned=$((scanned + 1))
+        [[ $scanned -le $max_info_plists ]] || break
+
+        bundle_root="${info%/Contents/Info.plist}"
+        [[ "$bundle_root" != "$app_path" ]] || continue
+        bundle_name="${bundle_root##*/}"
+        ext=$(printf '%s' "${bundle_name##*.}" | tr '[:upper:]' '[:lower:]')
+
+        case "$ext" in
+            xpc | appex) ;;
+            app)
+                case "$bundle_root" in
+                    "$app_path/Contents/Library/LoginItems/"*) ;;
+                    *) continue ;;
+                esac
+                ;;
+            *) continue ;;
+        esac
+
+        embedded_id=$(plutil -extract CFBundleIdentifier raw "$info" 2> /dev/null || true)
+        mole_is_reverse_dns_bundle_id "$embedded_id" || continue
+        [[ "$embedded_id" == "$primary_bundle_id" ]] && continue
+        # Shared framework services are not owned by every app that embeds them.
+        case "$embedded_id" in
+            org.sparkle-project.*)
+                continue
+                ;;
+        esac
+        printf '%s\n' "$embedded_id"
+    done < <(command find "$app_path/Contents" -maxdepth 12 -type f -path "*/Contents/Info.plist" -print0 2> /dev/null || true) | sort -u
+}
+
 # Locate files associated with an application
 find_app_files() {
     local bundle_id="$1"
     local app_name="$2"
+    local app_path="${3:-}"
 
     # Early validation: require at least one valid identifier
     # Skip scanning if both bundle_id and app_name are invalid
@@ -919,12 +999,43 @@ find_app_files() {
         done
     fi
 
-    # Shared file lists (.sfl4 - recent documents etc.)
+    # Shared file lists (recent documents etc.). Keep the root exact: only
+    # per-app ApplicationRecentDocuments files named by bundle id are owned by
+    # the uninstall target.
     if [[ "$bundle_id_valid" == "true" ]] &&
-        [[ -d "$HOME/Library/Application Support/com.apple.sharedfilelist" ]]; then
-        while IFS= read -r -d '' sfl4_file; do
-            files_to_clean+=("$sfl4_file")
-        done < <(command find "$HOME/Library/Application Support/com.apple.sharedfilelist" -maxdepth 2 -name "${bundle_id}.sfl4" -print0 2> /dev/null)
+        [[ -d "$HOME/Library/Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments" ]]; then
+        while IFS= read -r -d '' sfl_file; do
+            files_to_clean+=("$sfl_file")
+        done < <(command find "$HOME/Library/Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments" \
+            -maxdepth 1 -type f \
+            \( -name "${bundle_id}.sfl2" -o -name "${bundle_id}.sfl3" -o -name "${bundle_id}.sfl4" \) \
+            -print0 2> /dev/null)
+    fi
+
+    # Helper extensions and XPC services can persist their own bundle-id keyed
+    # user data. Read only bounded embedded bundle ids from the selected app,
+    # then map them to exact ~/Library paths. Keep this stricter than the Mac
+    # app's review-only scanner because CLI leftovers are deletable after the
+    # single uninstall confirmation.
+    if [[ "$bundle_id_valid" == "true" && -n "$app_path" ]]; then
+        local embedded_id embedded_candidate
+        while IFS= read -r embedded_id; do
+            [[ -n "$embedded_id" ]] || continue
+            for embedded_candidate in \
+                "$HOME/Library/Application Scripts/$embedded_id" \
+                "$HOME/Library/Application Support/FileProvider/$embedded_id" \
+                "$HOME/Library/Caches/$embedded_id" \
+                "$HOME/Library/Containers/$embedded_id" \
+                "$HOME/Library/HTTPStorages/$embedded_id" \
+                "$HOME/Library/HTTPStorages/$embedded_id.binarycookies" \
+                "$HOME/Library/Preferences/$embedded_id.plist" \
+                "$HOME/Library/WebKit/$embedded_id"; do
+                [[ -e "$embedded_candidate" ]] && files_to_clean+=("$embedded_candidate")
+            done
+            [[ -d "$HOME/Library/Preferences/ByHost" ]] && while IFS= read -r -d '' embedded_candidate; do
+                files_to_clean+=("$embedded_candidate")
+            done < <(command find "$HOME/Library/Preferences/ByHost" -maxdepth 1 -type f -name "${embedded_id}.*.plist" -print0 2> /dev/null)
+        done < <(_mole_uninstall_embedded_bundle_ids "$app_path" "$bundle_id")
     fi
 
     # Launch Agents by name (special handling)
@@ -1041,6 +1152,12 @@ find_app_files() {
         [[ -d ~/.mobiledev ]] && files_to_clean+=("$HOME/.mobiledev")
     fi
 
+    # Anki's profile directory (Anki2) contains decks, media, and backups.
+    # Only collect the launcher-managed support files here.
+    if [[ "$bundle_id" == "net.ankiweb.anki" ]] || [[ "$app_name" == "Anki" ]]; then
+        [[ -d "$HOME/Library/Application Support/AnkiProgramFiles" ]] && files_to_clean+=("$HOME/Library/Application Support/AnkiProgramFiles")
+    fi
+
     # 7. Raycast
     if [[ "$bundle_id" == "com.raycast.macos" ]]; then
         # Standard user directories
@@ -1107,6 +1224,10 @@ get_diagnostic_report_paths_for_app() {
     fi
     prefix="${exec_name:-$nospace_name}"
     [[ -z "$prefix" || ${#prefix} -lt 3 ]] && return 0
+    local -a prefixes=("$prefix")
+    if [[ "$prefix" != *" Helper" ]]; then
+        prefixes+=("$prefix Helper")
+    fi
 
     local dir_abs
     dir_abs=$(cd "$directory" 2> /dev/null && pwd -P 2> /dev/null) || return 0
@@ -1114,19 +1235,24 @@ get_diagnostic_report_paths_for_app() {
         [[ -z "$f" ]] && continue
         local base
         base=$(basename "$f" 2> /dev/null)
-        case "$base" in
-            "$prefix".* | "$prefix"_* | "$prefix"-*) ;;
-            *) continue ;;
-        esac
+        local matched_prefix=false
+        local report_prefix
+        for report_prefix in "${prefixes[@]}"; do
+            case "$base" in
+                "$report_prefix".* | "$report_prefix"_* | "$report_prefix"-*)
+                    matched_prefix=true
+                    break
+                    ;;
+            esac
+        done
+        [[ "$matched_prefix" == "true" ]] || continue
         case "$base" in
             *.ips | *.crash | *.spin | *.diag) ;;
             *) continue ;;
         esac
         printf '%s\n' "$f"
     done < <(
-        find "$dir_abs" -maxdepth 1 -type f \
-            \( -name "${prefix}.*" -o -name "${prefix}_*" -o -name "${prefix}-*" \) \
-            -print0 2> /dev/null || true
+        find "$dir_abs" -maxdepth 1 -type f -print0 2> /dev/null || true
     )
     return 0
 }

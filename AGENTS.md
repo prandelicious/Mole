@@ -6,6 +6,43 @@ This file is the shared source of truth for any AI agent working on this repo (C
 
 Mole is a macOS system cleanup and optimization tool with shell and Go components. It performs file cleanup, app protection checks, and maintenance tasks, so safety rules matter more than speed.
 
+## Product Direction
+
+Mole is a terminal-first macOS maintenance toolkit. Its core job is to help power users inspect reclaimable space, remove known-safe leftovers, uninstall apps safely, run bounded maintenance, and check health from a CLI, script, or compact TUI. It is not a general Mac control center, package manager, background monitor, or GUI feature mirror.
+
+### What Mole Should Do
+
+- Make cleanup and uninstall actions boring, reviewable, logged, protected by path/app rules, and dry-run capable.
+- Prefer reversible user-facing removals through Trash where the command surface expects recoverability.
+- Keep `clean`, `uninstall`, `purge`, and `installer` focused on reclaimable files, app leftovers, rebuildable caches, installer artifacts, and exact known cleanup targets.
+- Keep `analyze` as a disk explorer and ad hoc cleanup surface. Optimize first paint, navigation, sorting, filtering, and safe deletion before adding dashboard-style features.
+- Keep `status` as a compact read-only health dashboard plus stable JSON/NDJSON automation output. It may surface actionable signals, but should not become an iStat clone, alerting daemon, or configurable metrics workbench.
+- Keep `optimize` focused on explicit, bounded maintenance tasks that can be explained before execution and tested without real authorization prompts.
+- Keep command UX dense and terminal-native: short labels, stable alignment, predictable shortcuts, one-screen summaries, then optional drill-down.
+- Keep Mole Mac references as a cross-link or support path. The CLI and Mac app can share product values without requiring feature parity.
+
+### What Mole Should Not Do
+
+- Do not add broad system modification, privacy reset, package management, app bundle patching, or device-management features just because they are technically possible.
+- Do not remove or rewrite third-party app bundle contents, signed resources, user documents, credentials, sessions, active databases, or active developer-tool state.
+- Do not add background agents, persistent monitoring, notifications, schedulers, menu bar behavior, or GUI-like state unless explicitly requested and justified as CLI scope.
+- Do not broaden leftover matching from exact app or bundle evidence into vendor-wide, TeamID-prefix, generic-name, or fallback wildcard deletion.
+- Do not turn `status` into a noisy dashboard. Extra rows, live alerts, and tuning controls need a common user action, not just an available metric.
+- Do not add prompts, preferences, or output modes to solve every edge case. Prefer quieter defaults, preview/read-only guidance, or declining unsupported operations.
+- Do not treat Mole Mac features as required CLI gaps. The CLI should stay narrower, scriptable, and safety-first when parity would add complexity or ambiguity.
+
+### Product Decision Filter
+
+Before accepting a new feature, answer these questions in the PR, issue, or review notes when the fit is not obvious:
+
+1. Does it clearly belong to cleanup, uninstall, analyze, optimize, status, purge, installer, update, completion, touchid, install, or remove?
+2. Is it safe by default, previewable where destructive, testable without real auth, and explainable in one terminal screen?
+3. Can the user verify what will change before Mole changes it?
+4. Is the target data locally rebuildable, disposable, or backed by exact app/bundle evidence?
+5. Would this be better as Mole Mac UI, documentation, a warning, or an explicit "not supported" answer?
+
+If the answer is no or unclear, decline the feature, narrow it, or park it until the product value beats the added surface area.
+
 ## Repository Map
 
 - `mole` - main shell entrypoint.
@@ -13,7 +50,7 @@ Mole is a macOS system cleanup and optimization tool with shell and Go component
 - `lib/core/` - shared shell safety, UI, file operations, operation logs, app protection logic, and centralized timeout constants (`timeouts.sh`).
 - `lib/core/app_protection_data.sh` - readonly bundle ID and pattern arrays consumed by `app_protection.sh`. Data only, no logic.
 - `lib/clean/` - cleanup flows.
-- `lib/manage/` - whitelist, update, autofix, and purge path management.
+- `lib/manage/` - whitelist and purge path management.
 - `lib/optimize/` - optimization tasks.
 - `lib/check/` - health, diagnostics, and dev environment checks.
 - `lib/uninstall/` - app uninstall flows and package-manager removal helpers.
@@ -62,6 +99,13 @@ Public docs and examples should prefer the installed `mo` command. Use `./mole` 
 - Check `should_protect_path()` before adding cleanup behavior.
 - Check app protection helpers before adding app cache, uninstall, or leftover cleanup behavior.
 - Keep AI-tool cache cleanup conservative. Claude Code, opencode, Copilot CLI, Zed, Warp, Ghostty, and similar developer tools may have active versions, config, credentials, or session state that must not be removed accidentally.
+- Do not clean tiny macOS UI state just because it is rebuildable. Wallpaper previews, preference thumbnails, and similar cover/state caches can create visible blank or cloud-download UI while reclaiming only a few MB; keep them unless there is strong user value and a regression test.
+- Homebrew cleanup must be preview-first. Show the exact `brew autoremove` candidates before removal, preserve dry-run behavior, and keep tests on mocked `brew`; do not let a cleanup path execute real package-manager removals in verification.
+- Sudo gates must not treat typed password characters as "skip". Only an explicit skip key should skip privileged cleanup; direct typed input must proceed into the real sudo prompt and have a regression test.
+- Long cleanup scans need both an overall wall-clock budget and inner-loop checkpoints. If a project/artifact scan times out, degrade to partial or skipped-slow-scan output instead of appearing hung.
+- System-service orphan scans must parse plist `Program` / `ProgramArguments` values as absolute paths only. Use non-interactive sudo for unreadable root-owned plists when needed, reject PlistBuddy error text as data, and keep CI tests on `/Library/LaunchDaemons` rather than relying on `/Library/PrivilegedHelperTools`.
+- Uninstall leftover expansion must stay exact and boring: bundle ID or app-name variants only, reject generic/common words, keep short-name floors, skip broad locations like `Preferences/ByHost`, and only remove helper remnants after the parent app is confirmed gone and protected-path checks pass.
+- Preference repair and optimize cleanup must skip protected and whitelisted plists before attempting removal.
 - Keep shell code formatted with `./scripts/check.sh --format`.
 - Prefer targeted Bats tests during development; run the full suite before committing.
 - Do not add AI attribution trailers to commits.
@@ -116,7 +160,10 @@ golangci-lint run ./cmd/...
 
 ## GitHub Operations
 
+- Re-read the live issue or PR title, body, comments, state, labels, and author language before any public reply or closeout.
+- Keep CLI issues and Mole Mac app issues separate. A fix in `mole-mac` does not imply a close in this CLI repo, and a CLI fix does not prove a Mac app issue is fixed unless the Mac app release path is verified.
 - When closing a fixed bug or shipped feature, use project wording from the issue context and include the expected release path only when confirmed.
+- If a fix is on `main` but not in a stable release, prefer telling CLI users to try `mo update --nightly` now, then mention the next stable release only when that path is confirmed.
 
 ## Release
 
@@ -149,15 +196,7 @@ gh release edit V<version> --repo tw93/Mole \
   --notes-file <path>
 ```
 
-Format follows V1.37.0 onward: bilingual numbered changelog (English first, 中文 second), then a `Thanks 💖` block with sponsors and contributors, ending with the repo blockquote link. Order changelog items by user-perceived impact, not chronological commit order.
-
-Recent sponsors via `gh api graphql`:
-
-```bash
-gh api graphql -f query='{user(login:"tw93"){sponsorshipsAsMaintainer(first:30, orderBy:{field:CREATED_AT, direction:DESC}){nodes{sponsorEntity{... on User{login} ... on Organization{login}}}}}}'
-```
-
-The minimal query above works on a token without `read:user` scope. Adding `createdAt` or `privacyLevel` requires `read:user`.
+Format follows the recent compact release pages: centered Mole header, English `Changelog`, Chinese `更新日志`, optional `Mole Mac App` cross-link, then a short `Thanks 💖` line for issue reporters and PR contributors in this cycle. Do not add sponsor lists by default. Order changelog items by user-perceived impact, not chronological commit order.
 
 Add the standard reaction set (`+1`, `laugh`, `hooray`, `heart`, `rocket`, `eyes`):
 
